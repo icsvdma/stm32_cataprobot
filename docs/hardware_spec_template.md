@@ -99,6 +99,76 @@
 
 ### 5.1 MCUピン割り当て
 
+## 6. ピン割当サマリ
+
+### ESP32
+
+| GPIO | 機能 | 方向 | 備考 |
+|------|------|------|------|
+| IO16 | UART2_RX | IN | STM32通信 |
+| IO17 | UART2_TX | OUT | STM32通信 |
+| IO18 | ESP32_SDA | IN | I2Cデバイス通信 |
+| IO19 | ESP32_SCL | OUT | I2Cデバイス通信 |
+| IO21 | GPIO_POWON | OUT | メイン電源保持IO |
+| IO12 | SPI_MISO | IN | STM32通信 |
+| IO13 | SPI_MOSI | OUT | STM32通信 |
+| IO14 | SPI_SCK | OUT | STM32通信 |
+| IO15 | SPI_NSS | OUT | STM32通信 |
+| IO25 | GPIO_POW_ON | OUT | 電源保持 |
+| SENSOR_VP | BAT_SENSE | IN | +12Vバッテリ電圧監視 |
+| IO22 | DEBUG_LED | OUT | デバッグ表示LED |
+| IO23 | DEBUG_LED | OUT | デバッグ表示LED |
+| IO25 | DEBUG_LED | OUT | デバッグ表示LED |
+| IO26 | DEBUG_LED | OUT | デバッグ表示LED |
+| IO27 | DEBUG_LED | OUT | デバッグ表示LED |
+| IO32 | DEBUG_LED | OUT | デバッグ表示LED |
+| IO33 | DEBUG_LED | OUT | デバッグ表示LED |
+
+### STM32
+
+| ピン | 機能 | 方向 | 備考 |
+|------|------|------|------|
+| PA0 | FRONT_LED_R | OUT(PWM) | ヘッドライト右 |
+| PA1 | FRONT_LED_L | OUT(PWM) | ヘッドライト左 |
+| PA2 | USART2_TX | OUT | ESP32通信 |
+| PA3 | USART2_RX | IN | ESP32通信 |
+| PA4 | ESP32_NSS | IN | ESP32通信 |
+| PA5 | ESP32_SCK | IN | ESP32通信 |
+| PA6 | ESP32_MISO | OUT | ESP32通信 |
+| PA7 | ESP32_MOSI | IN | ESP32通信 |
+| PA11 | STM32USBDM | DIFF | STM32デバッグUSBポート |
+| PA12 | STM32USBDP | DIFF | STM32デバッグUSBポート |
+| PA14 | I2C_SDA | OUT | I2Cデバイス接続ポート |
+| PA15 | I2C_SCL | OUT | I2Cデバイス接続ポート |
+| PB0 | TIM_PWM | OUT | TB6575_PWM |
+| PB1 | GPIO | OUT | TB6575_FST |
+| PB2 | GPIO | OUT | TB6575_CW_CCW |
+| PB3 | GPIO | OUT | TB6575_FMAX |
+| PB4 | TIM_IC | IN | TB6575_FGOUT |
+| PB6 | 6608_MO_A | IN | TB6608_モニタ端子 |
+| PB7 | 6608_MO_B | IN | TB6608_モニタ端子 |
+| PB10 | GPIO | OUT | TB6608_CK_A |
+| PB11 | GPIO | OUT | TB6608_CK_B |
+| PB12 | GPIO | OUT | TB6608_CW_CCW_A |
+| PB13 | GPIO | OUT | TB6608_CW_CCW_B |
+| PB14 | GPIO | OUT | TB6608_RESET_A |
+| PB15 | GPIO | OUT | TB6608_RESET_B |
+| PC0 | GPIO | OUT | TB6608_PWM出力 |
+| PC1 | GPIO | OUT | TB6608_PWM出力 |
+| PC2 | GPIO | OUT | TB6608_スタンバイ |
+| PC6 | GPIO | OUT | TB6608_AIN1 |
+| PC7 | GPIO | OUT | TB6608_AIN2 |
+| PC8 | GPIO | OUT | TB6608_AIN1 |
+| PC9 | GPIO | OUT | TB6608_BIN2 |
+| PC10 | GPIO | OUT | デバッグ表示用LED |
+| PC11 | GPIO | OUT | デバッグ表示用LED |
+| PC12 | GPIO | OUT | デバッグ表示用LED |
+| PC13 | GPIO | OUT | デバッグ表示用LED |
+| PC14 | GPIO | OUT | デバッグ表示用LED |
+| PC15 | GPIO | OUT | デバッグ表示用LED |
+
+
+
 | MCU | ピン名 | 信号名 | 方向 | 電圧レベル | プル設定 | 接続先 | 備考 |
 |---|---|---|---|---|---|---|---|
 | （記入） | PA0 | （記入） | IN/OUT | 3.3V | PU/PD/なし | （記入） | |
