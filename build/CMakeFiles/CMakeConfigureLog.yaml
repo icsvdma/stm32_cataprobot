@@ -1,0 +1,11 @@
+
+---
+events:
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Users/7seve/AppData/Local/stm32cube/bundles/cmake/4.2.3+st.1/share/cmake-4.2/Modules/CMakeDetermineSystem.cmake:212 (message)"
+      - "CMakeLists.txt:28 (project)"
+    message: |
+      The system is: Windows - 10.0.26200 - AMD64
+...

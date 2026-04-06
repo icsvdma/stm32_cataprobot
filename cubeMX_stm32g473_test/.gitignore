@@ -1,0 +1,7 @@
+build
+cmake
+mx.scratch
+.settings
+Drivers
+EWARM
+.mxproject

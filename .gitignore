@@ -1,0 +1,9 @@
+cubeMX_stm32g473_test/build
+cubeMX_stm32g473_test/mx.scratch
+cubeMX_stm32g473_test/.settings
+
+esp32_firm/esp32_cataprobot/.pio
+esp32_firm/esp32_cataprobot/.vscode/.browse.c_cpp.db*
+esp32_firm/esp32_cataprobot/.vscode/c_cpp_properties.json
+esp32_firm/esp32_cataprobot/.vscode/launch.json
+esp32_firm/esp32_cataprobot/.vscode/ipch

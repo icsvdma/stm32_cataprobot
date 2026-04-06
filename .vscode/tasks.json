@@ -1,0 +1,19 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "PlatformIO Build ESP32",
+			"type": "shell",
+			"command": "platformio",
+			"args": [
+				"run",
+				"-d",
+				"esp32_firm/esp32_cataprobot"
+			],
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		}
+	]
+}
