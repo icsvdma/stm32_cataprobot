@@ -71,6 +71,7 @@ stm32_cataprobot/
         │   ├── packet.h          # パケット構造体（共通定義）
         │   ├── uart_comm.h       # USART2受信・送信
         │   ├── spi_comm.h        # SPI1 Slave受信
+        │   ├── debug_led.h       # デバッグLED制御 (PC10-PC15)
         │   ├── motor_dc.h        # TB6575 DCモーター制御
         │   ├── motor_stepper.h   # TB6608 ステッピング制御
         │   ├── sensor_mpu6050.h  # MPU6050 I2C取得
@@ -80,6 +81,7 @@ stm32_cataprobot/
             ├── packet.c
             ├── uart_comm.c
             ├── spi_comm.c
+            ├── debug_led.c
             ├── motor_dc.c
             ├── motor_stepper.c
             ├── sensor_mpu6050.c
@@ -112,11 +114,16 @@ stm32_cataprobot/
 | S1-02 | パケット構造体・チェックサム関数実装 (`packet`) | stm32/Core/Src/packet.c | 必須 |
 | S1-03 | USART2 DMA受信・割込送信 (`uart_comm`) | stm32/Core/Src/uart_comm.c | 必須 |
 | S1-04 | ウォッチドッグタイマ (IWDG) 有効化 | stm32/Core/Src/main.c | 必須 |
+| S1-05 | SPI1 Slave DMA受信初期化 (`spi_comm`) | stm32/Core/Src/spi_comm.c | 必須 |
+| S1-06 | デバッグ LED GPIO初期化・制御実装 (`debug_led`) | stm32/Core/Src/debug_led.c | 必須 |
+| S1-07 | SPI受信 → デバッグ LED 制御ハンドラ (CMD 0x40) | stm32/Core/Src/spi_comm.c | 必須 |
 
 #### 完了基準
 - [ ] ESP32 からのパケット送信を STM32 が受信し ACK を返す
 - [ ] チェックサム不一致時に NACK が返る
 - [ ] デバッグLED起動シーケンスが約1秒で完了する
+- [ ] ESP32 から SPI 経由で CMD 0x40 を送信し、STM32 デバッグ LED (PC10-PC15) が制御できる
+- [ ] デバッグ LED の ON/OFF/1Hz点滅/4Hz点滅 が正しく動作する
 
 ---
 
@@ -218,7 +225,7 @@ stm32_cataprobot/
 
 | タスクID | 内容 | 担当モジュール | 優先度 |
 |---|---|---|---|
-| S5-01 | SPI Slave 受信実装 | spi_comm.c | 推奨 |
+| S5-01 | SPI 冗長通信路実装（UART障害時のフォールバック） | spi_comm.c | 推奨 |
 | S5-02 | 通信途絶タイムアウト（1秒）監視→全停止 | uart_comm.c | 必須 |
 | S5-03 | IWDG リフレッシュ管理 | main.c | 必須 |
 

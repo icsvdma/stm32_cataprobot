@@ -348,7 +348,141 @@ static const struct {
     { 0x12, handle_led_brightness },
     { 0x20, handle_sensor_req     },
     { 0x30, handle_shutdown       },
+    { 0x40, handle_debug_led      },
 };
+```
+
+---
+
+### 3.3.1 `spi_comm` — SPI1 Slave 通信 (STM32側)
+
+ESP32 (Master) からの SPI コマンドを受信し、コマンドハンドラへディスパッチする。
+UART と同一のパケットプロトコルを使用する。
+
+#### SPI1 設定
+
+| 項目 | 値 |
+|---|---|
+| 動作モード | Slave |
+| NSS | PA4 (ハードウェア NSS) |
+| SCK | PA5 |
+| MISO | PA6 |
+| MOSI | PA7 |
+| クロック | 最大 10MHz（ESP32 Master 側で設定） |
+| データサイズ | 8bit |
+| CPOL/CPHA | 0/0 (Mode 0) |
+| 受信方式 | DMA (リングバッファ) |
+
+#### 受信フロー
+
+```
+NSS Low (ESP32がCSアサート)
+    │
+    ▼
+SPI DMA 受信開始
+    │
+    ▼
+NSS High (転送完了)
+    │
+    ▼
+パケット解析 (Packet_Parse)
+    │
+    ├─ 正常 → コマンドハンドラへディスパッチ（cmd_table と共通）
+    │         → MISO 経由で ACK (0x80) 返送
+    │
+    └─ エラー → MISO 経由で NACK (0x81) 返送
+```
+
+#### SPI コマンド定義（デバッグ LED 制御）
+
+| CMD | 名称 | ペイロード | 説明 |
+|---|---|---|---|
+| 0x40 | DEBUG_LED_SET | `[led_mask(1byte)][mode(1byte)]` | ビットマスクで指定した LED の ON/OFF/点滅を設定 |
+
+**led_mask ビット割当:**
+
+| Bit | LED | GPIO |
+|---|---|---|
+| bit0 | D0 | PC10 |
+| bit1 | D1 | PC11 |
+| bit2 | D2 | PC12 |
+| bit3 | D3 | PC13 |
+| bit4 | D4 | PC14 |
+| bit5 | D5 | PC15 |
+
+**mode 値:**
+
+| 値 | 動作 |
+|---|---|
+| 0x00 | OFF |
+| 0x01 | ON |
+| 0x02 | 1Hz 点滅 |
+| 0x03 | 4Hz 点滅 |
+
+#### 主要関数
+
+| 関数 | シグネチャ | 説明 |
+|---|---|---|
+| `SPI_Slave_Init` | `void SPI_Slave_Init(void)` | SPI1 Slave + DMA 初期化、受信バッファ準備 |
+| `SPI_Slave_StartReceive` | `void SPI_Slave_StartReceive(void)` | DMA 受信開始（NSS 割込連動） |
+| `SPI_Slave_Dispatch` | `void SPI_Slave_Dispatch(const uint8_t *buf, uint8_t len)` | 受信パケット解析 → cmd_table ハンドラ呼出 |
+| `SPI_Slave_SendResponse` | `HAL_StatusTypeDef SPI_Slave_SendResponse(const Packet_t *p)` | MISO 経由で応答パケット送信 |
+
+---
+
+### 3.3.2 `debug_led` — デバッグ LED (STM32側)
+
+STM32 の PC10〜PC15 に接続されたデバッグ LED を制御する。
+ESP32 から SPI 経由で受信した CMD 0x40 コマンドに応じて各 LED の状態を更新する。
+
+#### ピン構成
+
+| LED | GPIO | 説明 |
+|---|---|---|
+| D0 | PC10 | デバッグ LED 0 |
+| D1 | PC11 | デバッグ LED 1 |
+| D2 | PC12 | デバッグ LED 2 |
+| D3 | PC13 | デバッグ LED 3 |
+| D4 | PC14 | デバッグ LED 4 |
+| D5 | PC15 | デバッグ LED 5 |
+
+#### LED モード定義
+
+```c
+typedef enum {
+    DBG_LED_OFF    = 0x00,
+    DBG_LED_ON     = 0x01,
+    DBG_LED_BLINK_1HZ = 0x02,
+    DBG_LED_BLINK_4HZ = 0x03,
+} DebugLedMode_t;
+
+typedef struct {
+    GPIO_TypeDef   *port;
+    uint16_t        pin;
+    DebugLedMode_t  mode;
+    uint8_t         state;       // 現在の出力状態 (0/1)
+} DebugLed_t;
+```
+
+#### 主要関数
+
+| 関数 | シグネチャ | 説明 |
+|---|---|---|
+| `DebugLed_Init` | `void DebugLed_Init(void)` | PC10〜PC15 を GPIO 出力に初期化、全 LED OFF |
+| `DebugLed_Set` | `void DebugLed_Set(uint8_t led_mask, DebugLedMode_t mode)` | ビットマスクで指定した LED のモード設定 |
+| `DebugLed_Update` | `void DebugLed_Update(void)` | 点滅タイマ処理（メインループ内で周期的に呼出） |
+| `DebugLed_AllOff` | `void DebugLed_AllOff(void)` | 全 LED 消灯 |
+
+#### コマンドハンドラ
+
+```c
+static void handle_debug_led(const Packet_t *pkt)
+{
+    if (pkt->length < 2) return;
+    uint8_t led_mask = pkt->payload[0];
+    DebugLedMode_t mode = (DebugLedMode_t)pkt->payload[1];
+    DebugLed_Set(led_mask, mode);
+}
 ```
 
 #### 主要関数
@@ -548,6 +682,22 @@ STM32 (MPU6050)                 ESP32
 ```
 ESP32                           STM32
   │── CMD 0x30 (シャットダウン) →│
+
+```
+
+### 4.5 SPI デバッグ LED 制御
+
+```
+ESP32 (SPI Master)              STM32 (SPI Slave)
+  │                               │
+  │  NSS Low                      │
+  │── SPI CMD 0x40 ─────────────→│
+  │   [0xAA][0x40][0x02]          │
+  │   [led_mask][mode][checksum]  │
+  │                               │ DebugLed_Set(led_mask, mode)
+  │←── SPI ACK 0x80 ────────────│
+  │  NSS High                     │
+```
   │                               │ モーター停止
   │                               │ LED消灯
   │←── CMD 0xF0 (ACK) ──────────│
@@ -583,7 +733,7 @@ ESP32                           STM32
 | I2C チャネル | 1 | 3 |
 | SPI チャネル | 1 (Slave) | 3 |
 | USART チャネル | 1 (USART2) | 5 |
-| DMA チャネル | 2 (USART2 RX/TX) | 16 |
+| DMA チャネル | 4 (USART2 RX/TX + SPI1 RX/TX) | 16 |
 
 ---
 
