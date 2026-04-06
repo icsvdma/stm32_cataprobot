@@ -1,6 +1,7 @@
 #include "spi_comm.h"
 #include "config.h"
 #include "debug_led.h"
+#include "led_control.h"
 #include <string.h>
 
 /* ---------- 内部変数 ---------- */
@@ -60,6 +61,31 @@ void handle_debug_led(const Packet_t *pkt)
     DebugLed_Set(led_mask, mode);
 }
 
+/* ---------- CMD 0x11 ハンドラ ---------- */
+static void handle_led_mode(const Packet_t *pkt)
+{
+    if (pkt == NULL || pkt->length < 1) return;
+    uint8_t mode_id = pkt->payload[0];
+    if (mode_id > LM_BATTERY) return;
+    LED_SetMode((LedMode_t)mode_id);
+}
+
+/* ---------- CMD 0x12 ハンドラ ---------- */
+static void handle_led_brightness(const Packet_t *pkt)
+{
+    if (pkt == NULL || pkt->length < 2) return;
+    uint8_t led_id     = pkt->payload[0];
+    uint8_t brightness = pkt->payload[1];
+
+    LedSide_t side;
+    if (led_id == 0x00)      side = LED_SIDE_RIGHT;
+    else if (led_id == 0x01) side = LED_SIDE_LEFT;
+    else if (led_id == 0xFF) side = LED_SIDE_BOTH;
+    else return;
+
+    LED_SetBrightness(side, brightness);
+}
+
 /* ---------- CMD 0x03 暫定ハンドラ ---------- */
 static void handle_stepper_ctrl_led(const Packet_t *pkt)
 {
@@ -101,8 +127,10 @@ static const struct {
     uint8_t       cmd;
     CmdHandler_t  handler;
 } spi_cmd_table[] = {
-    { CMD_DEBUG_LED,   handle_debug_led      },
-    { CMD_STEPPER_CTRL, handle_stepper_ctrl_led },
+    { CMD_DEBUG_LED,    handle_debug_led        },
+    { CMD_LED_MODE,     handle_led_mode         },
+    { CMD_LED_BRIGHTNESS, handle_led_brightness  },
+    { CMD_STEPPER_CTRL, handle_stepper_ctrl_led  },
 };
 #define SPI_CMD_TABLE_SIZE  (sizeof(spi_cmd_table) / sizeof(spi_cmd_table[0]))
 
