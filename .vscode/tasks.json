@@ -21,7 +21,7 @@
         "command": "STM32_Programmer_CLI",
         "args": [
             "-c", "port=usb1",
-                "-d", "build/Debug/cubeMX_stm32g473_test.elf",
+                "-d", "cubeMX_stm32g473_test/build/Debug/cubeMX_stm32g473_test.elf",
                 "-v",
                 "-s"
             ],
