@@ -27,6 +27,7 @@
 #include "spi_comm.h"
 #include "debug_led.h"
 #include "led_control.h"
+#include "motor_tb6612.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -117,6 +118,7 @@ int main(void)
 	DebugLed_Init();
 	SPI_Slave_Init(&hspi1);
 	LED_Init(&htim2);
+	TB6612_Init(&htim1);
 		DebugLed_Set(0x01, DBG_LED_BLINK_4HZ);  /* LED0 = メインループ動作確認 */
 	GPIOC->BSRR = PIN_DBG_LED1;             /* LED1 = 全Init通過マーカー */
   /* USER CODE END 2 */
@@ -131,6 +133,7 @@ int main(void)
 	SPI_Slave_Poll();
 	DebugLed_Update();
 	LED_Update();
+	TB6612_Update();
 	HAL_IWDG_Refresh(&hiwdg);
   }
   /* USER CODE END 3 */
