@@ -14,6 +14,27 @@
 				"$gcc"
 			],
 			"group": "build"
-		}
+		},
+    {
+        "label": "Flash via DFU",
+        "type": "shell",
+        "command": "STM32_Programmer_CLI",
+        "args": [
+            "-c", "port=usb1",
+                "-d", "cubeMX_stm32g473_test/build/Debug/cubeMX_stm32g473_test.elf",
+                "-v",
+                "-s"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "cmd.exe",
+                    "args": ["/c"]
+                }
+            },
+            "group": "build",
+            "problemMatcher": [],
+            "detail": "STM32CubeProgrammer で USB DFU 書き込み"
+        }		
 	]
 }

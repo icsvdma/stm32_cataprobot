@@ -73,6 +73,7 @@ stm32_cataprobot/
         │   ├── spi_comm.h        # SPI1 Slave受信
         │   ├── debug_led.h       # デバッグLED制御 (PC10-PC15)
         │   ├── motor_dc.h        # TB6575 DCモーター制御
+        │   ├── motor_tb6612.h    # TB6612 デュアルDCモーター制御
         │   ├── motor_stepper.h   # TB6608 ステッピング制御
         │   ├── sensor_mpu6050.h  # MPU6050 I2C取得
         │   └── led_control.h     # ヘッドライトLED制御
@@ -83,6 +84,7 @@ stm32_cataprobot/
             ├── spi_comm.c
             ├── debug_led.c
             ├── motor_dc.c
+            ├── motor_tb6612.c
             ├── motor_stepper.c
             ├── sensor_mpu6050.c
             └── led_control.c
@@ -129,7 +131,7 @@ stm32_cataprobot/
 
 ### Phase 2: モーター制御（目安 2週間）
 
-**目標**: TB6575 DC制御・TB6608 ステッパ制御の実装と UART 経由の遠隔操作
+**目標**: TB6612 DC 制御・TB6608 ステッパ制御の実装と SPI/UART 経由の遠隔操作
 
 #### ESP32 タスク
 
@@ -143,16 +145,26 @@ stm32_cataprobot/
 
 | タスクID | 内容 | 担当モジュール | 優先度 |
 |---|---|---|---|
-| S2-01 | TB6575 PWM生成 (TIM3_CH3)・方向GPIO制御 | motor_dc.c | 必須 |
-| S2-02 | FGOUT 入力キャプチャ (TIM) による RPM 算出 | motor_dc.c | 必須 |
-| S2-03 | 方向反転シーケンス（減速→停止→逆転）実装 | motor_dc.c | 必須 |
-| S2-04 | TB6608 パルス生成（タイマ割込）・A/B 軸独立制御 | motor_stepper.c | 必須 |
-| S2-05 | ステッピング台形加減速プロファイル | motor_stepper.c | 推奨 |
-| S2-06 | MO 出力監視による脱調検出 | motor_stepper.c | 推奨 |
-| S2-07 | UART コマンドハンドラ実装 (0x01〜0x04) | uart_comm.c | 必須 |
+| S2-01 | TB6612 GPIO 初期化（AIN1/AIN2/BIN1/BIN2/STBY） | motor_tb6612.c | 必須 |
+| S2-02 | TB6612 STBY 制御（起動時 HIGH、緊急停止時 LOW） | motor_tb6612.c | 必須 |
+| S2-03 | TB6612 回転方向制御（CW/CCW/ブレーキ/コースト） | motor_tb6612.c | 必須 |
+| S2-04 | TB6612 PWM 速度制御 (TIM1_CH1/CH2, 20kHz) | motor_tb6612.c | 必須 |
+| S2-05 | TB6612 A/B ch 独立制御 | motor_tb6612.c | 必須 |
+| S2-06 | TB6612 方向反転シーケンス（減速→停止→逆転） | motor_tb6612.c | 必須 |
+| S2-07 | TB6612 台形加減速プロファイル（スルーレート制限） | motor_tb6612.c | 推奨 |
+| S2-08 | TB6575 PWM生成 (TIM3_CH3)・方向GPIO制御 | motor_dc.c | 必須 |
+| S2-09 | FGOUT 入力キャプチャ (TIM) による RPM 算出 | motor_dc.c | 必須 |
+| S2-10 | 方向反転シーケンス（減速→停止→逆転）実装 | motor_dc.c | 必須 |
+| S2-11 | TB6608 パルス生成（タイマ割込）・A/B 軸独立制御 | motor_stepper.c | 必須 |
+| S2-12 | ステッピング台形加減速プロファイル | motor_stepper.c | 推奨 |
+| S2-13 | MO 出力監視による脱調検出 | motor_stepper.c | 推奨 |
+| S2-14 | SPI/UART コマンドハンドラ実装 (0x01〜0x04) | spi_comm.c / uart_comm.c | 必須 |
 
 #### 完了基準
-- [ ] ESP32 からの UART コマンドで DC モーターの速度・方向を制御できる
+- [ ] ESP32 からのコマンドで TB6612 の A/B ch それぞれの速度・方向を独立制御できる
+- [ ] TB6612 の正転・逆転・ブレーキ・コーストの 4 状態が正しく動作する
+- [ ] TB6612 の急反転時に減速→停止→逆転シーケンスが実行される
+- [ ] ESP32 からの UART コマンドで TB6575 DC モーターの速度・方向を制御できる
 - [ ] RPM 値が STM32 → ESP32 のステータス応答 (0x90) に含まれる
 - [ ] ステッパが指定ステップ数を正確に動作する
 

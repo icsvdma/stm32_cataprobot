@@ -47,6 +47,22 @@
 #define PIN_6608_RESET_B        GPIO_PIN_15 /* PB15 */
 #define PORT_6608_RESET_B       GPIOB
 
+/* TB6612FNG デュアル DC モーター */
+#define PIN_TB6612_PWMA         GPIO_PIN_0  /* PC0 (TIM1_CH1) */
+#define PORT_TB6612_PWMA        GPIOC
+#define PIN_TB6612_PWMB         GPIO_PIN_1  /* PC1 (TIM1_CH2) */
+#define PORT_TB6612_PWMB        GPIOC
+#define PIN_TB6612_STBY         GPIO_PIN_2  /* PC2 */
+#define PORT_TB6612_STBY        GPIOC
+#define PIN_TB6612_AIN1         GPIO_PIN_6  /* PC6 */
+#define PORT_TB6612_AIN1        GPIOC
+#define PIN_TB6612_AIN2         GPIO_PIN_7  /* PC7 */
+#define PORT_TB6612_AIN2        GPIOC
+#define PIN_TB6612_BIN1         GPIO_PIN_8  /* PC8 */
+#define PORT_TB6612_BIN1        GPIOC
+#define PIN_TB6612_BIN2         GPIO_PIN_9  /* PC9 */
+#define PORT_TB6612_BIN2        GPIOC
+
 /* デバッグ LED (PC10-PC15) */
 #define PIN_DBG_LED0            GPIO_PIN_10 /* PC10 */
 #define PIN_DBG_LED1            GPIO_PIN_11 /* PC11 */
