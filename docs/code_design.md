@@ -72,14 +72,11 @@
 #define PIN_SPI_MOSI        13
 #define PIN_SPI_SCK         14
 #define PIN_SPI_NSS         15
-#define PIN_GPIO_POW_ON     25   // GPIO_POW_ON (F-E02)
+#define PIN_GPIO_POW_ON     21
 #define PIN_BAT_SENSE       36   // SENSOR_VP (ADC1_CH0)
 #define PIN_DEBUG_LED_0     22
 #define PIN_DEBUG_LED_1     23
-// NOTE: 要件定義書では D9 (UART LED) に IO25 が割り当てられているが、
-//       IO25 は GPIO_POW_ON (安全制御ピン) と競合する。
-//       回路図レビュー時に別ピンへの変更を推奨 (例: IO21)。
-#define PIN_DEBUG_LED_2     21   // D9: UART通信 LED (IO25競合のためIO21代替案)
+#define PIN_DEBUG_LED_2     25
 #define PIN_DEBUG_LED_3     26
 #define PIN_DEBUG_LED_4     27
 #define PIN_DEBUG_LED_5     32
