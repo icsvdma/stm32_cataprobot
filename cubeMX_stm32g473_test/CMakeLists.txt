@@ -49,6 +49,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/spi_comm.c
     Core/Src/debug_led.c
     Core/Src/led_control.c
+    Core/Src/motor_tb6612.c
 )
 
 # Add include paths
