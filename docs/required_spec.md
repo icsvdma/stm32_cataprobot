@@ -36,7 +36,7 @@ STM32 に転送してモーター駆動・センサ取得・LED 制御を行う
                     │   STM32     │
                     │ G473RCTx    │
                     │             │
-                    │ ・モーター  ├──→ TB6575 (DC)
+                    │ ・モーター  ├──→ TB6612 (DC)
                     │ ・ステッパ  ├──→ TB6608 (Stepper)
                     │ ・センサ    ├──→ MPU6050 (I2C)
                     │ ・LED制御   ├──→ Headlight LED
@@ -181,11 +181,11 @@ STM32 に転送してモーター駆動・センサ取得・LED 制御を行う
 
 ### 2.2 STM32 機能一覧
 
-#### F-S01: DC モーター制御（TB6575）
+#### F-S01: DC モーター制御（TB6612）
 
 | 項目 | 仕様 |
 |------|------|
-| 機能概要 | TB6575 モータードライバを PWM で制御し、DC モーターの回転方向・速度を制御する |
+| 機能概要 | TB6612 モータードライバを PWM で制御し、DC モーターの回転方向・速度を制御する |
 | 使用ペリフェラル | TIM3_CH3 (PB0=PWM), GPIO (PB1=FST, PB2=CW_CCW, PB3=FMAX) |
 | フィードバック | PB4 = FGOUT（回転数パルス入力、TIM 入力キャプチャ） |
 
@@ -280,6 +280,73 @@ STM32 に転送してモーター駆動・センサ取得・LED 制御を行う
   ・LM_BATTERY : バッテリー低下時に通常モードに重畳
 ```
 
+#### F-S05: DC モーター制御（TB6612FNG）
+
+| 項目 | 仕様 |
+|------|------|
+| 機能概要 | TB6612FNG デュアル H ブリッジモータードライバで 2ch の DC モーターの回転方向・速度を独立制御する |
+| ドライバ IC | TB6612FNG（東芝、デュアル H ブリッジ） |
+| 最大出力電流 | 1.2A（連続）/ 3.2A（ピーク）per ch |
+| 電源電圧 | VM = 4.5〜13.5V, VCC = 2.7〜5.5V |
+| ch 数 | 2ch（A / B）独立制御 |
+
+##### ピン構成
+
+| 信号 | MCU ピン | 方向 | 説明 |
+|------|----------|------|------|
+| PWMA | PC0 (TIM1_CH1) | OUT | A ch 速度制御（PWM） |
+| PWMB | PC1 (TIM1_CH2) | OUT | B ch 速度制御（PWM） |
+| STBY | PC2 | OUT | スタンバイ制御（HIGH = 動作 / LOW = スタンバイ） |
+| AIN1 | PC6 | OUT | A ch 方向制御 1 |
+| AIN2 | PC7 | OUT | A ch 方向制御 2 |
+| BIN1 | PC8 | OUT | B ch 方向制御 1 |
+| BIN2 | PC9 | OUT | B ch 方向制御 2 |
+
+##### 回転方向制御（真理値表）
+
+| xIN1 | xIN2 | PWM | モーター動作 |
+|------|------|-----|-------------|
+| LOW | LOW | — | 停止（コースト） |
+| HIGH | LOW | PWM duty | 正転（CW） |
+| LOW | HIGH | PWM duty | 逆転（CCW） |
+| HIGH | HIGH | — | ブレーキ（ショートブレーキ） |
+
+> ※ `x` は `A` または `B` を表す。各 ch で独立に方向を設定可能。
+
+##### 速度制御
+
+| 項目 | 仕様 |
+|------|------|
+| PWM 周波数 | 20kHz（推奨。可聴域外で静音動作） |
+| PWM 分解能 | 0〜100%（duty 比で速度を指定） |
+| タイマ | TIM1_CH1 (PWMA) / TIM1_CH2 (PWMB) |
+| 加減速制御 | 急激な duty 変更を避け、台形制御またはスルーレート制限を適用 |
+
+##### 要件一覧
+
+| 要件ID | 要件 | 優先度 |
+|--------|------|--------|
+| F-S05-01 | A/B 各 ch の回転方向（CW / CCW）を指定できること | 必須 |
+| F-S05-02 | A/B 各 ch の回転速度を PWM duty 0〜100% で指定できること | 必須 |
+| F-S05-03 | A/B ch を独立して制御できること | 必須 |
+| F-S05-04 | STBY ピンを HIGH にして動作状態にできること | 必須 |
+| F-S05-05 | 停止時はコースト停止（xIN1=L, xIN2=L）とブレーキ停止（xIN1=H, xIN2=H）を選択できること | 必須 |
+| F-S05-06 | 急激な方向反転時は減速→停止→逆転のシーケンスを実行すること | 必須 |
+| F-S05-07 | 緊急停止時は即座にブレーキ停止＋STBY=LOW にできること | 必須 |
+| F-S05-08 | 加減速カーブ（台形制御またはスルーレート制限）を適用できること | 推奨 |
+
+```
+コマンド仕様（CMD 0x01 モーター速度設定 — TB6612 拡張）:
+
+  Payload: [ch][dir][speed_H][speed_L]
+    ch      : 0x00=A, 0x01=B, 0xFF=両方
+    dir     : 0x00=CW(正転), 0x01=CCW(逆転), 0x02=ブレーキ, 0x03=コースト
+    speed_H : 速度上位バイト (0-1000)
+    speed_L : 速度下位バイト
+
+  Payload: [ch] のみ → CMD 0x02 モーター停止（コースト停止）
+```
+
 ---
 
 ### 2.3 デバッグ LED 仕様
@@ -329,8 +396,8 @@ Byte:  [0]      [1]     [2]       [3..N]      [N+1]
 
 | CMD | 方向 | 名称 | Payload |
 |-----|------|------|---------|
-| 0x01 | ESP→STM | モーター速度設定 | [dir][speed_H][speed_L] |
-| 0x02 | ESP→STM | モーター停止 | (なし) |
+| 0x01 | ESP→STM | モーター速度設定 | [ch][dir][speed_H][speed_L] |
+| 0x02 | ESP→STM | モーター停止 | [ch] (省略時=全ch) |
 | 0x03 | ESP→STM | ステッピング制御 | [id][dir][steps_H][steps_L][speed] |
 | 0x04 | ESP→STM | 緊急停止 | (なし) |
 | 0x10 | ESP→STM | ステータス要求 | (なし) |
@@ -392,8 +459,8 @@ Byte:  [0]      [1]     [2]       [3..N]      [N+1]
 - [ ] パケットプロトコル実装・検証
 
 ### Phase 2: モーター制御（2週間）
-- [ ] TB6575 PWM 制御（STM32 単体）
-- [ ] TB6575 FGOUT 回転数取得
+- [ ] TB6612 PWM 制御（STM32 単体）
+- [ ] TB6612 回転方向指定（STM32 単体）
 - [ ] TB6608 ステッピング制御（タイマ割込）
 - [ ] ESP32 → UART → STM32 → モーター駆動の一気通貫
 
@@ -459,11 +526,11 @@ Byte:  [0]      [1]     [2]       [3..N]      [N+1]
 | PA12 | STM32USBDP | DIFF | STM32デバッグUSBポート |
 | PA14 | I2C_SDA | OUT | I2Cデバイス接続ポート |
 | PA15 | I2C_SCL | OUT | I2Cデバイス接続ポート |
-| PB0 | TIM_PWM | OUT | TB6575_PWM |
-| PB1 | GPIO | OUT | TB6575_FST |
-| PB2 | GPIO | OUT | TB6575_CW_CCW |
-| PB3 | GPIO | OUT | TB6575_FMAX |
-| PB4 | TIM_IC | IN | TB6575_FGOUT |
+| PB0 | TIM_PWM | OUT | TB6612_PWM |
+| PB1 | GPIO | OUT | TB6612_FST |
+| PB2 | GPIO | OUT | TB6612_CW_CCW |
+| PB3 | GPIO | OUT | TB6612_FMAX |
+| PB4 | TIM_IC | IN | TB6612_FGOUT |
 | PB6 | 6608_MO_A | IN | TB6608_モニタ端子 |
 | PB7 | 6608_MO_B | IN | TB6608_モニタ端子 |
 | PB10 | GPIO | OUT | TB6608_CK_A |
@@ -472,13 +539,13 @@ Byte:  [0]      [1]     [2]       [3..N]      [N+1]
 | PB13 | GPIO | OUT | TB6608_CW_CCW_B |
 | PB14 | GPIO | OUT | TB6608_RESET_A |
 | PB15 | GPIO | OUT | TB6608_RESET_B |
-| PC0 | GPIO | OUT | TB6608_PWM出力 |
-| PC1 | GPIO | OUT | TB6608_PWM出力 |
-| PC2 | GPIO | OUT | TB6608_スタンバイ |
-| PC6 | GPIO | OUT | TB6608_AIN1 |
-| PC7 | GPIO | OUT | TB6608_AIN2 |
-| PC8 | GPIO | OUT | TB6608_AIN1 |
-| PC9 | GPIO | OUT | TB6608_BIN2 |
+| PC0 | GPIO | OUT | TB6612_PWM出力A |
+| PC1 | GPIO | OUT | TB6612_PWM出力B |
+| PC2 | GPIO | OUT | TB6612_スタンバイ |
+| PC6 | GPIO | OUT | TB6612_AIN1 |
+| PC7 | GPIO | OUT | TB6612_AIN2 |
+| PC8 | GPIO | OUT | TB6612_AIN1 |
+| PC9 | GPIO | OUT | TB6612_BIN2 |
 | PC10 | GPIO | OUT | デバッグ表示用LED |
 | PC11 | GPIO | OUT | デバッグ表示用LED |
 | PC12 | GPIO | OUT | デバッグ表示用LED |
