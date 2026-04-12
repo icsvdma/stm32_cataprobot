@@ -2,6 +2,7 @@
 #include "config.h"
 #include "debug_led.h"
 #include "led_control.h"
+#include "motor_tb6612.h"
 #include <string.h>
 
 /* ---------- 内部変数 ---------- */
@@ -86,6 +87,50 @@ static void handle_led_brightness(const Packet_t *pkt)
     LED_SetBrightness(side, brightness);
 }
 
+/* ---------- CMD 0x01 モーター速度設定ハンドラ ---------- */
+static void handle_motor_speed(const Packet_t *pkt)
+{
+    if (pkt == NULL || pkt->length < 4) return;
+    uint8_t ch_id  = pkt->payload[0];
+    uint8_t dir_id = pkt->payload[1];
+    uint16_t speed = ((uint16_t)pkt->payload[2] << 8) | pkt->payload[3];
+
+    if (dir_id > TB6612_DIR_COAST) return;
+    TB6612_Dir_t dir = (TB6612_Dir_t)dir_id;
+
+    if (ch_id == 0xFF) {
+        TB6612_SetMotor(TB6612_CH_A, dir, speed);
+        TB6612_SetMotor(TB6612_CH_B, dir, speed);
+    } else if (ch_id <= TB6612_CH_B) {
+        TB6612_SetMotor((TB6612_Channel_t)ch_id, dir, speed);
+    }
+}
+
+/* ---------- CMD 0x02 モーター停止ハンドラ ---------- */
+static void handle_motor_stop(const Packet_t *pkt)
+{
+    if (pkt == NULL) return;
+    if (pkt->length >= 1) {
+        uint8_t ch_id = pkt->payload[0];
+        if (ch_id == 0xFF) {
+            TB6612_Stop(TB6612_CH_A);
+            TB6612_Stop(TB6612_CH_B);
+        } else if (ch_id <= TB6612_CH_B) {
+            TB6612_Stop((TB6612_Channel_t)ch_id);
+        }
+    } else {
+        TB6612_Stop(TB6612_CH_A);
+        TB6612_Stop(TB6612_CH_B);
+    }
+}
+
+/* ---------- CMD 0x04 緊急停止ハンドラ ---------- */
+static void handle_emergency_stop(const Packet_t *pkt)
+{
+    (void)pkt;
+    TB6612_EmergencyStop();
+}
+
 /* ---------- CMD 0x03 暫定ハンドラ ---------- */
 static void handle_stepper_ctrl_led(const Packet_t *pkt)
 {
@@ -127,10 +172,13 @@ static const struct {
     uint8_t       cmd;
     CmdHandler_t  handler;
 } spi_cmd_table[] = {
-    { CMD_DEBUG_LED,    handle_debug_led        },
-    { CMD_LED_MODE,     handle_led_mode         },
-    { CMD_LED_BRIGHTNESS, handle_led_brightness  },
-    { CMD_STEPPER_CTRL, handle_stepper_ctrl_led  },
+    { CMD_MOTOR_SPEED,    handle_motor_speed      },
+    { CMD_MOTOR_STOP,     handle_motor_stop        },
+    { CMD_STEPPER_CTRL,   handle_stepper_ctrl_led  },
+    { CMD_EMERGENCY_STOP, handle_emergency_stop    },
+    { CMD_LED_MODE,       handle_led_mode          },
+    { CMD_LED_BRIGHTNESS, handle_led_brightness    },
+    { CMD_DEBUG_LED,      handle_debug_led         },
 };
 #define SPI_CMD_TABLE_SIZE  (sizeof(spi_cmd_table) / sizeof(spi_cmd_table[0]))
 
