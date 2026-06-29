@@ -15,26 +15,62 @@
 			],
 			"group": "build"
 		},
-    {
-        "label": "Flash via DFU",
-        "type": "shell",
-        "command": "STM32_Programmer_CLI",
-        "args": [
-            "-c", "port=usb1",
-                "-d", "cubeMX_stm32g473_test/build/Debug/cubeMX_stm32g473_test.elf",
-                "-v",
-                "-s"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}",
-                "shell": {
-                    "executable": "cmd.exe",
-                    "args": ["/c"]
-                }
-            },
-            "group": "build",
-            "problemMatcher": [],
-            "detail": "STM32CubeProgrammer で USB DFU 書き込み"
-        }		
+		{
+			"label": "STM32 Build Debug",
+			"type": "shell",
+			"command": "cmake",
+			"args": [
+				"--build",
+				"cubeMX_stm32g473_test/build/Debug"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}",
+				"shell": {
+					"executable": "cmd.exe",
+					"args": [
+						"/c"
+					]
+				}
+			},
+			"group": "build",
+			"problemMatcher": [
+				"$gcc"
+			]
+		},
+		{
+			"label": "STM32 Flash via DFU",
+			"type": "shell",
+			"command": "STM32_Programmer_CLI",
+			"args": [
+				"-c",
+				"port=USB1",
+				"-w",
+				"cubeMX_stm32g473_test/build/Debug/cubeMX_stm32g473_test.elf",
+				"-v",
+				"-s",
+				"0x08000000"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}",
+				"shell": {
+					"executable": "cmd.exe",
+					"args": [
+						"/c"
+					]
+				}
+			},
+			"group": "build",
+			"problemMatcher": [],
+			"detail": "Write the Debug firmware to STM32 Flash through USB DFU."
+		},
+		{
+			"label": "STM32 Build and Flash via DFU",
+			"dependsOrder": "sequence",
+			"dependsOn": [
+				"STM32 Build Debug",
+				"STM32 Flash via DFU"
+			],
+			"problemMatcher": []
+		}
 	]
 }
