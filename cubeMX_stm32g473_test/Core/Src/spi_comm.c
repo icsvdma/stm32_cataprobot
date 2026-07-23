@@ -2,20 +2,47 @@
 #include "config.h"
 #include "debug_led.h"
 #include "led_control.h"
-#include "motor_tb6612.h"
+#include "motor_hbridge.h"
+#include "external_sensors.h"
 #include <string.h>
 
-/* ---------- 内部変数 ---------- */
+/* NACKでESP32へ通知するエラー理由。 */
+#define SPI_ERROR_UNKNOWN_COMMAND   0x01U
+#define SPI_ERROR_INVALID_PARAMETER 0x02U
+
+/* 割り込みとメインループで共有するSPI受信・応答状態。 */
 static SPI_HandleTypeDef *s_hspi;
-static uint8_t  s_rx_buf[SPI_RX_BUF_SIZE];
-static uint8_t  s_rx_idx = 0;
+static uint8_t s_rx_buf[SPI_RX_BUF_SIZE];
+static volatile uint8_t s_rx_idx = 0U;
 
-/* ---------- 応答 TX バッファ ---------- */
-static uint8_t  s_tx_buf[PACKET_MAX_SIZE];
-static uint8_t  s_tx_len = 0;
-static uint8_t  s_tx_idx = 0;
+static uint8_t s_tx_buf[PACKET_MAX_SIZE + 1U];
+static volatile uint8_t s_tx_len = 0U;
+static volatile uint8_t s_tx_idx = 0U;
+static volatile uint32_t s_last_rx_tick = 0U;
+static volatile uint8_t s_frame_parsed = 0U;
 
-/* ---------- 応答プリロード ---------- */
+/* 各コマンドハンドラーの内部処理結果。 */
+typedef enum {
+    CMD_HANDLER_OK = 0,
+    CMD_HANDLER_INVALID_PARAMETER,
+} CmdHandlerResult_t;
+
+/**
+ * @brief 符号付き16 bit値をビッグエンディアンで書き込む。
+ * @param destination 2 byteの書き込み先。
+ * @param value 書き込む値。
+ * @return なし。
+ */
+static void write_s16_be(uint8_t *destination, int16_t value)
+{
+    destination[0] = (uint8_t)((uint16_t)value >> 8);
+    destination[1] = (uint8_t)value;
+}
+
+/**
+ * @brief 送信可能な間、準備済み応答をSPIデータレジスターへ入れる。
+ * @return なし。
+ */
 static void preload_tx(void)
 {
     SPI_TypeDef *spi = s_hspi->Instance;
@@ -24,245 +51,373 @@ static void preload_tx(void)
     }
 }
 
-static void prepare_ack(void)
+/**
+ * @brief ターンアラウンド用1 byteの後ろへ応答パケットを準備する。
+ * @param packet ESP32のパディングクロック中に返す応答。
+ * @return なし。
+ */
+static void prepare_response(const Packet_t *packet)
+{
+    /* 最初の送信byteが失われても、次から0xAA付きパケットが始まる。 */
+    s_tx_buf[0] = 0x00U;
+    s_tx_len = (uint8_t)(1U + Packet_Serialize(packet, &s_tx_buf[1]));
+    s_tx_idx = 0U;
+    preload_tx();
+}
+
+/** @brief 元コマンドID入りACKを準備する。@param original_cmd 元ID。@return なし。 */
+static void prepare_ack(uint8_t original_cmd)
 {
     Packet_t ack;
-    Packet_Build(&ack, CMD_ACK, NULL, 0);
-    s_tx_len = Packet_Serialize(&ack, s_tx_buf);
-    s_tx_idx = 0;
-    preload_tx();
+    Packet_Build(&ack, CMD_ACK, &original_cmd, 1U);
+    prepare_response(&ack);
 }
 
-static void prepare_nack(uint8_t error_code)
+/**
+ * @brief 元コマンドIDと理由を含むNACKを準備する。
+ * @param original_cmd 元コマンドID。
+ * @param error_code エラー理由。
+ * @return なし。
+ */
+static void prepare_nack(uint8_t original_cmd, uint8_t error_code)
 {
     Packet_t nack;
-    Packet_Build(&nack, CMD_NACK, &error_code, 1);
-    s_tx_len = Packet_Serialize(&nack, s_tx_buf);
-    s_tx_idx = 0;
-    preload_tx();
+    uint8_t payload[2] = {original_cmd, error_code};
+    Packet_Build(&nack, CMD_NACK, payload, sizeof(payload));
+    prepare_response(&nack);
 }
 
-/* ---------- CMD 0x40 ハンドラ ---------- */
-void handle_debug_led(const Packet_t *pkt)
+/** @brief シャットダウン完了応答を準備する。@return なし。 */
+static void prepare_shutdown_ack(void)
 {
-    if (pkt == NULL || pkt->length < 1) {
-        return;
-    }
-    uint8_t led_mask = pkt->payload[0];
-    /* payload[1] が省略された場合は DBG_LED_ON をデフォルト */
-    DebugLedMode_t mode = (pkt->length >= 2)
-                          ? (DebugLedMode_t)pkt->payload[1]
-                          : DBG_LED_ON;
+    Packet_t ack;
+    Packet_Build(&ack, CMD_SHUTDOWN_ACK, NULL, 0U);
+    prepare_response(&ack);
+}
 
-    led_mask &= 0x3F;
+/** @brief 最新センサー値をVersion 2の32 byte応答へ変換する。@return なし。 */
+static void prepare_sensor_response(void)
+{
+    ExternalSensorSnapshot_t snapshot;
+    Packet_t response;
+    uint8_t payload[32];
+
+    /* 複数byte値はESP32仕様に合わせてビッグエンディアンで並べる。 */
+    ExternalSensors_GetSnapshot(&snapshot);
+    payload[0] = 0x02U;
+    payload[1] = snapshot.status;
+    payload[2] = (uint8_t)(snapshot.sequence >> 8);
+    payload[3] = (uint8_t)snapshot.sequence;
+    payload[4] = (uint8_t)(snapshot.sample_time_ms >> 24);
+    payload[5] = (uint8_t)(snapshot.sample_time_ms >> 16);
+    payload[6] = (uint8_t)(snapshot.sample_time_ms >> 8);
+    payload[7] = (uint8_t)snapshot.sample_time_ms;
+    write_s16_be(&payload[8], snapshot.acceleration_x_mg);
+    write_s16_be(&payload[10], snapshot.acceleration_y_mg);
+    write_s16_be(&payload[12], snapshot.acceleration_z_mg);
+    write_s16_be(&payload[14], snapshot.gyroscope_x_deci_dps);
+    write_s16_be(&payload[16], snapshot.gyroscope_y_deci_dps);
+    write_s16_be(&payload[18], snapshot.gyroscope_z_deci_dps);
+    write_s16_be(&payload[20], snapshot.magnetic_x_deci_ut);
+    write_s16_be(&payload[22], snapshot.magnetic_y_deci_ut);
+    write_s16_be(&payload[24], snapshot.magnetic_z_deci_ut);
+    write_s16_be(&payload[26], snapshot.temperature_centi_c);
+    payload[28] = (uint8_t)(snapshot.pressure_pa >> 24);
+    payload[29] = (uint8_t)(snapshot.pressure_pa >> 16);
+    payload[30] = (uint8_t)(snapshot.pressure_pa >> 8);
+    payload[31] = (uint8_t)snapshot.pressure_pa;
+
+    Packet_Build(&response, CMD_SENSOR_RESP, payload, sizeof(payload));
+    prepare_response(&response);
+}
+
+/**
+ * @brief デバッグLEDコマンドを検証して実行する。
+ * @param pkt 受信パケット。
+ * @return 正常またはパラメーターエラー。
+ */
+static CmdHandlerResult_t process_debug_led(const Packet_t *pkt)
+{
+    if (pkt == NULL || (pkt->length != 1U && pkt->length != 2U)) {
+        return CMD_HANDLER_INVALID_PARAMETER;
+    }
+
+    uint8_t led_mask = pkt->payload[0] & 0x3FU;
+    DebugLedMode_t mode = (pkt->length == 2U)
+                              ? (DebugLedMode_t)pkt->payload[1]
+                              : DBG_LED_ON;
     if (mode > DBG_LED_BLINK_4HZ) {
-        return;
+        return CMD_HANDLER_INVALID_PARAMETER;
     }
 
     DebugLed_Set(led_mask, mode);
+    return CMD_HANDLER_OK;
 }
 
-/* ---------- CMD 0x11 ハンドラ ---------- */
-static void handle_led_mode(const Packet_t *pkt)
+/* UARTのコマンドテーブルからも呼べる公開入口。 */
+void handle_debug_led(const Packet_t *pkt)
 {
-    if (pkt == NULL || pkt->length < 1) return;
-    uint8_t mode_id = pkt->payload[0];
-    if (mode_id > LM_BATTERY) return;
-    LED_SetMode((LedMode_t)mode_id);
+    (void)process_debug_led(pkt);
 }
 
-/* ---------- CMD 0x12 ハンドラ ---------- */
-static void handle_led_brightness(const Packet_t *pkt)
+/**
+ * @brief ライト動作モードコマンドを処理する。
+ * @param pkt 受信パケット。
+ * @return 正常またはパラメーターエラー。
+ */
+static CmdHandlerResult_t handle_led_mode(const Packet_t *pkt)
 {
-    if (pkt == NULL || pkt->length < 2) return;
-    uint8_t led_id     = pkt->payload[0];
-    uint8_t brightness = pkt->payload[1];
+    if (pkt == NULL || pkt->length != 1U || pkt->payload[0] > LM_BATTERY) {
+        return CMD_HANDLER_INVALID_PARAMETER;
+    }
+    LED_SetMode((LedMode_t)pkt->payload[0]);
+    return CMD_HANDLER_OK;
+}
+
+/**
+ * @brief 左右ヘッドライト光量コマンドを処理する。
+ * @param pkt 受信パケット。
+ * @return 正常またはパラメーターエラー。
+ */
+static CmdHandlerResult_t handle_led_brightness(const Packet_t *pkt)
+{
+    if (pkt == NULL || pkt->length != 2U || pkt->payload[1] > 100U) {
+        return CMD_HANDLER_INVALID_PARAMETER;
+    }
 
     LedSide_t side;
-    if (led_id == 0x00)      side = LED_SIDE_RIGHT;
-    else if (led_id == 0x01) side = LED_SIDE_LEFT;
-    else if (led_id == 0xFF) side = LED_SIDE_BOTH;
-    else return;
+    if (pkt->payload[0] == 0x00U) {
+        side = LED_SIDE_RIGHT;
+    } else if (pkt->payload[0] == 0x01U) {
+        side = LED_SIDE_LEFT;
+    } else if (pkt->payload[0] == 0xFFU) {
+        side = LED_SIDE_BOTH;
+    } else {
+        return CMD_HANDLER_INVALID_PARAMETER;
+    }
 
-    LED_SetBrightness(side, brightness);
+    LED_SetBrightness(side, pkt->payload[1]);
+    return CMD_HANDLER_OK;
 }
 
-/* ---------- CMD 0x01 モーター速度設定ハンドラ ---------- */
-static void handle_motor_speed(const Packet_t *pkt)
+/**
+ * @brief モーター方向・速度コマンドをHブリッジ制御へ渡す。
+ * @param pkt 受信パケット。
+ * @return 正常またはパラメーターエラー。
+ */
+static CmdHandlerResult_t handle_motor_speed(const Packet_t *pkt)
 {
-    if (pkt == NULL || pkt->length < 4) return;
-    uint8_t ch_id  = pkt->payload[0];
+    if (pkt == NULL || pkt->length != 4U) {
+        return CMD_HANDLER_INVALID_PARAMETER;
+    }
+
+    uint8_t ch_id = pkt->payload[0];
     uint8_t dir_id = pkt->payload[1];
     uint16_t speed = ((uint16_t)pkt->payload[2] << 8) | pkt->payload[3];
-
-    if (dir_id > TB6612_DIR_COAST) return;
-    TB6612_Dir_t dir = (TB6612_Dir_t)dir_id;
-
-    if (ch_id == 0xFF) {
-        TB6612_SetMotor(TB6612_CH_A, dir, speed);
-        TB6612_SetMotor(TB6612_CH_B, dir, speed);
-    } else if (ch_id <= TB6612_CH_B) {
-        TB6612_SetMotor((TB6612_Channel_t)ch_id, dir, speed);
+    if (dir_id > HBRIDGE_DIR_BRAKE || speed > 1000U) {
+        return CMD_HANDLER_INVALID_PARAMETER;
     }
-}
 
-/* ---------- CMD 0x02 モーター停止ハンドラ ---------- */
-static void handle_motor_stop(const Packet_t *pkt)
-{
-    if (pkt == NULL) return;
-    if (pkt->length >= 1) {
-        uint8_t ch_id = pkt->payload[0];
-        if (ch_id == 0xFF) {
-            TB6612_Stop(TB6612_CH_A);
-            TB6612_Stop(TB6612_CH_B);
-        } else if (ch_id <= TB6612_CH_B) {
-            TB6612_Stop((TB6612_Channel_t)ch_id);
-        }
+    HBridge_Direction_t dir = (HBridge_Direction_t)dir_id;
+    if (ch_id == 0xFFU) {
+        HBridge_SetMotor(HBRIDGE_CH_A, dir, speed);
+        HBridge_SetMotor(HBRIDGE_CH_B, dir, speed);
+    } else if (ch_id <= HBRIDGE_CH_B) {
+        HBridge_SetMotor((HBridge_Channel_t)ch_id, dir, speed);
     } else {
-        TB6612_Stop(TB6612_CH_A);
-        TB6612_Stop(TB6612_CH_B);
+        return CMD_HANDLER_INVALID_PARAMETER;
     }
+    return CMD_HANDLER_OK;
 }
 
-/* ---------- CMD 0x04 緊急停止ハンドラ ---------- */
-static void handle_emergency_stop(const Packet_t *pkt)
+/**
+ * @brief 指定モーターの通常停止コマンドを処理する。
+ * @param pkt 受信パケット。
+ * @return 正常またはパラメーターエラー。
+ */
+static CmdHandlerResult_t handle_motor_stop(const Packet_t *pkt)
 {
-    (void)pkt;
-    TB6612_EmergencyStop();
-}
-
-/* ---------- CMD 0x03 暫定ハンドラ ---------- */
-static void handle_stepper_ctrl_led(const Packet_t *pkt)
-{
-    if (pkt == NULL) {
-        return;
+    if (pkt == NULL || pkt->length != 1U) {
+        return CMD_HANDLER_INVALID_PARAMETER;
     }
-    DebugLed_Set(0x08, DBG_LED_ON);
+
+    uint8_t ch_id = pkt->payload[0];
+    if (ch_id == 0xFFU) {
+        HBridge_Stop(HBRIDGE_CH_A);
+        HBridge_Stop(HBRIDGE_CH_B);
+    } else if (ch_id <= HBRIDGE_CH_B) {
+        HBridge_Stop((HBridge_Channel_t)ch_id);
+    } else {
+        return CMD_HANDLER_INVALID_PARAMETER;
+    }
+    return CMD_HANDLER_OK;
 }
 
-/* ---------- 初期化 ---------- */
+/**
+ * @brief 左右モーターの緊急停止コマンドを処理する。
+ * @param pkt 受信パケット。
+ * @return 正常またはパラメーターエラー。
+ */
+static CmdHandlerResult_t handle_emergency_stop(const Packet_t *pkt)
+{
+    if (pkt == NULL || pkt->length != 0U) {
+        return CMD_HANDLER_INVALID_PARAMETER;
+    }
+    HBridge_EmergencyStop();
+    return CMD_HANDLER_OK;
+}
+
 void SPI_Slave_Init(SPI_HandleTypeDef *hspi)
 {
     s_hspi = hspi;
-    s_rx_idx = 0;
+    s_rx_idx = 0U;
     memset(s_rx_buf, 0, sizeof(s_rx_buf));
-    s_tx_len = 0;
-    s_tx_idx = 0;
+    s_tx_len = 0U;
+    s_tx_idx = 0U;
 
     /*
-     * CubeMX の SPI 設定 (Hardware NSS Slave) をそのまま使用。
-     * DMA・EXTI は一切使わず、メインループでレジスタ直接ポーリング。
-     * 全 SPI 関連割込みを無効化 → ISR 競合を根本排除。
+     * I2Cのブロッキング読み取り中でもSPIを取りこぼさないよう、
+     * SPI1割り込みで1 byteずつ処理する。
      */
-    s_hspi->Instance->CR2 &= ~(SPI_CR2_TXEIE | SPI_CR2_RXNEIE | SPI_CR2_ERRIE);
-    HAL_NVIC_DisableIRQ(SPI1_IRQn);
+    s_hspi->Instance->CR2 &= ~SPI_CR2_TXEIE;
+    s_hspi->Instance->CR2 |= SPI_CR2_RXNEIE | SPI_CR2_ERRIE;
     HAL_NVIC_DisableIRQ(DMA1_Channel2_IRQn);
     HAL_NVIC_DisableIRQ(EXTI4_IRQn);
 
     __HAL_SPI_ENABLE(s_hspi);
+    HAL_NVIC_ClearPendingIRQ(SPI1_IRQn);
+    HAL_NVIC_EnableIRQ(SPI1_IRQn);
 }
 
-/* ---------- DMA 受信開始 (互換性のため残す — no-op) ---------- */
-void SPI_Slave_StartReceive(void) { /* no-op */ }
+void SPI_Slave_StartReceive(void)
+{
+    /* 受信はSPI_Slave_IRQHandlerが常時処理するため何もしない。 */
+}
 
-/* ---------- コマンドテーブル (SPI 経由) ---------- */
-typedef void (*CmdHandler_t)(const Packet_t *pkt);
+typedef CmdHandlerResult_t (*CmdHandler_t)(const Packet_t *pkt);
 
 static const struct {
-    uint8_t       cmd;
-    CmdHandler_t  handler;
+    uint8_t cmd;
+    CmdHandler_t handler;
 } spi_cmd_table[] = {
-    { CMD_MOTOR_SPEED,    handle_motor_speed      },
-    { CMD_MOTOR_STOP,     handle_motor_stop        },
-    { CMD_STEPPER_CTRL,   handle_stepper_ctrl_led  },
-    { CMD_EMERGENCY_STOP, handle_emergency_stop    },
-    { CMD_LED_MODE,       handle_led_mode          },
-    { CMD_LED_BRIGHTNESS, handle_led_brightness    },
-    { CMD_DEBUG_LED,      handle_debug_led         },
+    {CMD_MOTOR_SPEED, handle_motor_speed},
+    {CMD_MOTOR_STOP, handle_motor_stop},
+    {CMD_EMERGENCY_STOP, handle_emergency_stop},
+    {CMD_LED_MODE, handle_led_mode},
+    {CMD_LED_BRIGHTNESS, handle_led_brightness},
+    {CMD_DEBUG_LED, process_debug_led},
 };
-#define SPI_CMD_TABLE_SIZE  (sizeof(spi_cmd_table) / sizeof(spi_cmd_table[0]))
 
-/* ---------- パケットディスパッチ ---------- */
+#define SPI_CMD_TABLE_SIZE (sizeof(spi_cmd_table) / sizeof(spi_cmd_table[0]))
+
 void SPI_Slave_Dispatch(const uint8_t *buf, uint8_t len)
 {
     Packet_t pkt;
-    if (!Packet_Parse(buf, len, &pkt)) {
-        prepare_nack(0x02);   /* パラメータ範囲外 / パースエラー */
+    uint8_t original_cmd = (buf != NULL && len >= 2U) ? buf[1] : 0U;
+    if (buf == NULL || !Packet_Parse(buf, len, &pkt)) {
+        prepare_nack(original_cmd, SPI_ERROR_INVALID_PARAMETER);
         return;
     }
 
-    for (uint16_t i = 0; i < SPI_CMD_TABLE_SIZE; i++) {
+    /* センサー要求とシャットダウンは専用応答があるため個別処理する。 */
+    if (pkt.cmd == CMD_SENSOR_REQ) {
+        if (pkt.length != 1U || pkt.payload[0] != 0xFFU) {
+            prepare_nack(pkt.cmd, SPI_ERROR_INVALID_PARAMETER);
+            return;
+        }
+        prepare_sensor_response();
+        return;
+    }
+
+    if (pkt.cmd == CMD_SHUTDOWN) {
+        if (pkt.length != 0U) {
+            prepare_nack(pkt.cmd, SPI_ERROR_INVALID_PARAMETER);
+            return;
+        }
+        HBridge_EmergencyStop();
+        LED_AllOff();
+        DebugLed_AllOff();
+        prepare_shutdown_ack();
+        return;
+    }
+
+    /* 通常コマンドはテーブルから処理関数を探す。 */
+    for (uint16_t i = 0U; i < SPI_CMD_TABLE_SIZE; i++) {
         if (spi_cmd_table[i].cmd == pkt.cmd) {
-            spi_cmd_table[i].handler(&pkt);
-            prepare_ack();
+            CmdHandlerResult_t result = spi_cmd_table[i].handler(&pkt);
+            if (result == CMD_HANDLER_OK) {
+                prepare_ack(pkt.cmd);
+            } else {
+                prepare_nack(pkt.cmd, SPI_ERROR_INVALID_PARAMETER);
+            }
             return;
         }
     }
 
-    prepare_nack(0x01);       /* 不明なコマンド */
+    prepare_nack(pkt.cmd, SPI_ERROR_UNKNOWN_COMMAND);
 }
 
-/* ---------- 応答送信 ---------- */
 HAL_StatusTypeDef SPI_Slave_SendResponse(const Packet_t *p)
 {
     uint8_t buf[PACKET_MAX_SIZE];
     uint8_t len = Packet_Serialize(p, buf);
-    return HAL_SPI_Transmit(s_hspi, buf, len, 100);
+    return HAL_SPI_Transmit(s_hspi, buf, len, 100U);
 }
 
-/* ---------- コールバック (互換性のため残す — no-op) ---------- */
-void SPI_Slave_RxCompleteCallback(void) { /* no-op */ }
-void SPI_Slave_NssRisingCallback(void)  { /* no-op */ }
-
-/* ---------- メインループから呼ぶ SPI 受信処理 ---------- */
-/*
- * 割込み・DMA を一切使わないレジスタ直接ポーリング方式。
- * NOP ディレイなしでメインループを高速周回させ、
- * コマンド受信 → 早期パース → パディング期間中に MISO で ACK/NACK 送出。
- *
- * プロトコル仕様:
- *   ESP32 は [コマンド(4-36bytes)] + [0x00 パディング(8bytes以上)] を
- *   1つの CS アサーション内で送信する。
- *   STM32 はコマンドバイト受信完了後、パディング期間中に MISO で応答を返す。
- *   ESP32 はパディング期間中の MISO バイトから 0xAA ヘッダを探して応答を取得。
- */
-static uint32_t s_last_rx_tick = 0;
-static uint8_t  s_frame_parsed = 0;
-
-void SPI_Slave_Poll(void)
+void SPI_Slave_RxCompleteCallback(void)
 {
+    /* 旧DMA方式との互換用。現在は割り込みハンドラーが受信する。 */
+}
+
+void SPI_Slave_NssRisingCallback(void)
+{
+    /* CS解除はSPI_Slave_PollがGPIOと経過時間から判定する。 */
+}
+
+void SPI_Slave_IRQHandler(void)
+{
+    if (s_hspi == NULL) {
+        return;
+    }
+
     SPI_TypeDef *spi = s_hspi->Instance;
 
-    /* ---- RXNE がある限り読む。同時に TX 応答バイトを書き込む ---- */
+    /* RXNEが立っている間、送信を補充しながら受信byteを保存する。 */
     while (spi->SR & SPI_SR_RXNE) {
-        /* TX: 応答バイトがあり TXE が立っていれば DR に書く */
         if (s_tx_idx < s_tx_len && (spi->SR & SPI_SR_TXE)) {
             *(volatile uint8_t *)&spi->DR = s_tx_buf[s_tx_idx++];
         }
 
-        /* RX: 受信バイトを格納 */
         uint8_t byte = *(volatile uint8_t *)&spi->DR;
         if (s_rx_idx < SPI_RX_BUF_SIZE) {
             s_rx_buf[s_rx_idx++] = byte;
         }
         s_last_rx_tick = HAL_GetTick();
 
-        /* ---- 早期パース: フレームをまだパースしていない場合 ---- */
-        if (!s_frame_parsed && s_rx_idx >= 4) {
-            for (uint8_t i = 0; i < s_rx_idx; i++) {
-                if (s_rx_buf[i] != PACKET_HEADER) continue;
-                uint8_t rem = s_rx_idx - i;
-                if (rem < 4) break;
-                uint8_t payload_len = s_rx_buf[i + 2];
-                if (payload_len > PACKET_MAX_PAYLOAD) break;
-                uint8_t pkt_len = 3 + payload_len + 1;
-                if (rem < pkt_len) break;
+        /* 最小4 byteが届いたら0xAAを探し、完全なパケットを早期解析する。 */
+        if (!s_frame_parsed && s_rx_idx >= 4U) {
+            for (uint8_t i = 0U; i < s_rx_idx; i++) {
+                if (s_rx_buf[i] != PACKET_HEADER) {
+                    continue;
+                }
 
-                /* パース完了 → Dispatch (内部で prepare_ack/nack + preload_tx) */
-                SPI_Slave_Dispatch(&s_rx_buf[i], pkt_len);
-                s_frame_parsed = 1;
+                uint8_t remaining = s_rx_idx - i;
+                if (remaining < 4U) {
+                    break;
+                }
 
-                /* Dispatch 直後: TXE が立っていれば続けて TX FIFO に書き込む */
+                uint8_t payload_len = s_rx_buf[i + 2U];
+                if (payload_len > PACKET_MAX_PAYLOAD) {
+                    break;
+                }
+
+                uint8_t packet_len = 3U + payload_len + 1U;
+                if (remaining < packet_len) {
+                    break;
+                }
+
+                SPI_Slave_Dispatch(&s_rx_buf[i], packet_len);
+                s_frame_parsed = 1U;
                 while (s_tx_idx < s_tx_len && (spi->SR & SPI_SR_TXE)) {
                     *(volatile uint8_t *)&spi->DR = s_tx_buf[s_tx_idx++];
                 }
@@ -271,29 +426,39 @@ void SPI_Slave_Poll(void)
         }
     }
 
-    /* ---- OVR (オーバーラン) クリア ---- */
+    /* オーバーランはDR、SRの順に読み、フラグを解除する。 */
     if (spi->SR & SPI_SR_OVR) {
         (void)spi->DR;
         (void)spi->SR;
     }
+}
 
-    /* ---- CS HIGH 検出 → フレーム終了、次フレームの準備 ---- */
-    if (s_rx_idx > 0) {
-        /* PA4 = NSS: Hardware NSS は SPI ペリフェラルが使うが GPIO でも読める */
-        uint8_t cs_high  = (GPIOA->IDR & GPIO_PIN_4) ? 1 : 0;
+void SPI_Slave_Poll(void)
+{
+    if (s_hspi == NULL) {
+        return;
+    }
+
+    SPI_TypeDef *spi = s_hspi->Instance;
+    if (s_rx_idx > 0U) {
+        uint8_t cs_high = (GPIOA->IDR & GPIO_PIN_4) ? 1U : 0U;
         uint32_t elapsed = HAL_GetTick() - s_last_rx_tick;
+        /*
+         * CSがHigh、または最後の受信から10 ms経過したら
+         * 割り込みを一時停止し、次のフレーム用に状態を戻す。
+         */
+        if (!(spi->SR & SPI_SR_BSY) && (cs_high || elapsed >= 10U)) {
+            HAL_NVIC_DisableIRQ(SPI1_IRQn);
+            s_rx_idx = 0U;
+            s_tx_len = 0U;
+            s_tx_idx = 0U;
+            s_frame_parsed = 0U;
+            s_last_rx_tick = 0U;
 
-        /* BSY=0 かつ (CS HIGH または 10ms タイムアウト) でフレーム終了 */
-        if (!(spi->SR & SPI_SR_BSY) && (cs_high || elapsed >= 10)) {
-            s_rx_idx = 0;
-            s_tx_len = 0;
-            s_tx_idx = 0;
-            s_frame_parsed = 0;
-            s_last_rx_tick = 0;
-
-            /* TX/RX FIFO フラッシュ: SPE OFF→ON */
             spi->CR1 &= ~SPI_CR1_SPE;
             spi->CR1 |= SPI_CR1_SPE;
+            HAL_NVIC_ClearPendingIRQ(SPI1_IRQn);
+            HAL_NVIC_EnableIRQ(SPI1_IRQn);
         }
     }
 }
