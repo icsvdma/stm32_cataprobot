@@ -1,6 +1,7 @@
 #include "packet.h"
 #include <string.h>
 
+/* cmd、length、payloadをXORし、通信中の1 bit誤りを検出する。 */
 uint8_t Packet_Checksum(const Packet_t *p)
 {
     uint8_t cs = p->cmd ^ p->length;
@@ -12,6 +13,7 @@ uint8_t Packet_Checksum(const Packet_t *p)
 
 void Packet_Build(Packet_t *p, uint8_t cmd, const uint8_t *payload, uint8_t len)
 {
+    /* 固定長配列を超えないよう、長すぎるデータは切り詰める。 */
     if (len > PACKET_MAX_PAYLOAD) {
         len = PACKET_MAX_PAYLOAD;
     }
@@ -26,6 +28,7 @@ void Packet_Build(Packet_t *p, uint8_t cmd, const uint8_t *payload, uint8_t len)
 
 uint8_t Packet_Serialize(const Packet_t *p, uint8_t *buf)
 {
+    /* SPI/UARTで送れるよう、隙間のないバイト列へ並べる。 */
     uint8_t idx = 0;
     buf[idx++] = p->header;
     buf[idx++] = p->cmd;
@@ -39,7 +42,7 @@ uint8_t Packet_Serialize(const Packet_t *p, uint8_t *buf)
 
 bool Packet_Parse(const uint8_t *buf, uint8_t len, Packet_t *out)
 {
-    /* 最小パケット長: header(1) + cmd(1) + length(1) + checksum(1) = 4 */
+    /* 最小構成はheader、cmd、length、checksumの4 byte。 */
     if (len < 4) {
         return false;
     }
@@ -53,7 +56,7 @@ bool Packet_Parse(const uint8_t *buf, uint8_t len, Packet_t *out)
     if (out->length > PACKET_MAX_PAYLOAD) {
         return false;
     }
-    /* 必要な合計バイト数を検証 */
+    /* lengthが示すpayloadとchecksumまで届いているか確認する。 */
     uint8_t expected_len = 3 + out->length + 1;
     if (len < expected_len) {
         return false;
@@ -61,5 +64,6 @@ bool Packet_Parse(const uint8_t *buf, uint8_t len, Packet_t *out)
     memcpy(out->payload, &buf[3], out->length);
     out->checksum = buf[3 + out->length];
 
+    /* 最後にチェックサムが一致したパケットだけを受け入れる。 */
     return (out->checksum == Packet_Checksum(out));
 }
