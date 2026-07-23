@@ -52,7 +52,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/spi_comm.c
     Core/Src/debug_led.c
     Core/Src/led_control.c
-    Core/Src/motor_tb6612.c
+    Core/Src/motor_hbridge.c
+    Core/Src/icm20948.c
+    Core/Src/bmp280.c
+    Core/Src/external_sensors.c
 )
 
 # Add include paths
