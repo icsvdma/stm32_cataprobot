@@ -1,741 +1,482 @@
 # コード設計書
-## デュアルMCUモーター制御システム（ESP32 + STM32）
+
+[プロジェクトREADME](../README.md) | [資料一覧](README.md) | [コードマップ](コードマップ.md)
+
+## PS3 - ESP32 - STM32 2ch DCモーター制御
 
 | 項目 | 内容 |
 |---|---|
-| ドキュメントバージョン | 1.0 |
-| 作成日 | 2026-03-21 |
-| ステータス | ドラフト |
-| 参照元 | docs/required_spec.md, docs/implementation_plan.md |
+| ドキュメントバージョン | 2.3 |
+| 更新日 | 2026-07-23 |
+| ステータス | 現行実装（実機動作確認済み） |
+| 対象 | PS3入力、2ch DCモーター、ヘッドライト、バッテリー表示、センサーモニター |
 
 ---
 
-## 1. システムアーキテクチャ概要
+## 1. 対象範囲
 
-```
-┌───────────────────────────────────────────┐
-│              コントローラー (BT)           │
-│  PS4/PS5 / BLE ゲームパッド               │
-└──────────────────────┬────────────────────┘
-                       │ Bluetooth (SPP/BLE HID)
-┌──────────────────────▼────────────────────┐
-│               ESP32-WROOM-32D              │
-│                                            │
-│  ┌──────────────┐  ┌────────────────────┐  │
-│  │ bt_controller│  │  battery_monitor   │  │
-│  │  (HID受信)   │  │  (ADC 1秒周期)     │  │
-│  └──────┬───────┘  └─────────┬──────────┘  │
-│         │                    │              │
-│  ┌──────▼───────┐  ┌─────────▼──────────┐  │
-│  │  uart_comm   │  │  power_manager     │  │
-│  │ (UART2送受信)│  │ (GPIO_POW_ON制御)  │  │
-│  └──────┬───────┘  └────────────────────┘  │
-│         │ SPI1 (冗長路)                    │
-│  ┌──────▼───────┐                          │
-│  │  spi_comm    │                          │
-│  │ (SPI1 Master)│                          │
-│  └──────┬───────┘                          │
-└─────────┼─────────────────────────────────┘
-          │ UART2 (115200bps, 8N1) / SPI1
-┌─────────▼─────────────────────────────────┐
-│               STM32G473RCTx                │
-│                                            │
-│  ┌──────────────┐  ┌────────────────────┐  │
-│  │  uart_comm   │  │    spi_comm        │  │
-│  │ (USART2受信) │  │  (SPI1 Slave)      │  │
-│  └──────┬───────┘  └────────────────────┘  │
-│         │ コマンドディスパッチ              │
-│  ┌──────┴────────────────────────────────┐ │
-│  │            コマンドハンドラ            │ │
-│  └──┬──────────┬──────────┬──────────┬───┘ │
-│     │          │          │          │     │
-│  ┌──▼────┐ ┌───▼───┐ ┌───▼────┐ ┌───▼───┐ │
-│  │motor  │ │motor  │ │sensor  │ │ led   │ │
-│  │_dc    │ │_step  │ │_mpu6050│ │_ctrl  │ │
-│  │(TIM3) │ │(TIM割 │ │(I2C)   │ │(TIM   │ │
-│  │       │ │ 込)   │ │        │ │ PWM)  │ │
-│  └───────┘ └───────┘ └────────┘ └───────┘ │
-└───────────────────────────────────────────┘
+本書は、現在使用している2ch Hブリッジモータードライバ回路によるDCモーター制御を対象とする。
+PS3コントローラーのスティック入力をESP32で左右モーターの指令値に変換し、SPI経由でSTM32へ送信してモーターを駆動するまでの処理を定義する。
+
+---
+
+## 2. システム構成
+
+```text
+PS3コントローラー
+  左スティックY軸: 前進・後退
+  右スティックX軸: 左旋回・右旋回
+  ▲ボタン: ヘッドライト光量切替
+          |
+          | Bluetooth Classic
+          v
+ESP32
+  - スティック値取得
+  - デッドゾーン処理
+  - 左右モーター指令値の算出
+  - 方向・速度コマンド生成
+  - 12VバッテリーADC監視とPlayer LED表示
+          |
+          | SPI Mode 0 / 1 MHz
+          v
+STM32G473RCTx
+  - SPIパケット解析
+  - チャンネル別の目標方向・目標速度更新
+  - 加減速および反転シーケンス処理
+          |
+          | TIM8 CH1 - CH4 / 20 kHz PWM
+          v
+2ch Hブリッジモータードライバ回路
+          |
+          +--> Motor A（左）
+          +--> Motor B（右）
+
+STM32 TIM2 CH1 / CH2
+          |
+          +--> 右 / 左ヘッドライトPWM
 ```
 
 ---
 
-## 2. ESP32 モジュール設計
+## 3. 共通パケット仕様
 
-### 2.1 `config.h` — グローバル定数・ピン定義
+### 3.1 パケット形式
 
-```c
-// ピン定義
-#define PIN_UART2_RX        16
-#define PIN_UART2_TX        17
-#define PIN_SPI_MISO        12
-#define PIN_SPI_MOSI        13
-#define PIN_SPI_SCK         14
-#define PIN_SPI_NSS         15
-#define PIN_GPIO_POW_ON     21
-#define PIN_BAT_SENSE       36   // SENSOR_VP (ADC1_CH0)
-#define PIN_DEBUG_LED_0     22
-#define PIN_DEBUG_LED_1     23
-#define PIN_DEBUG_LED_2     25
-#define PIN_DEBUG_LED_3     26
-#define PIN_DEBUG_LED_4     27
-#define PIN_DEBUG_LED_5     32
-#define PIN_DEBUG_LED_6     33
-
-// バッテリー閾値 (mV)
-#define BAT_VOLTAGE_FULL    12000
-#define BAT_VOLTAGE_NORMAL  10500
-#define BAT_VOLTAGE_LOW     10500
-#define BAT_VOLTAGE_CRITICAL 9500
-
-// 通信設定
-#define UART2_BAUD          115200
-#define UART_ACK_TIMEOUT_MS 200
-#define UART_RETRY_MAX      3
-
-// タイムアウト設定
-#define BT_DISCONNECT_TIMEOUT_MS  500
-#define BT_RECONNECT_TIMEOUT_MS   30000
-#define COMM_WATCHDOG_MS          1000
-#define SHUTDOWN_TIMEOUT_MS       3000
+```text
+[HEADER][CMD][LENGTH][PAYLOAD ...][CHECKSUM]
 ```
 
----
+| フィールド | サイズ | 内容 |
+|---|---:|---|
+| `HEADER` | 1 byte | `0xAA` 固定 |
+| `CMD` | 1 byte | コマンドID |
+| `LENGTH` | 1 byte | ペイロード長（0〜32 byte） |
+| `PAYLOAD` | 可変 | コマンド固有データ |
+| `CHECKSUM` | 1 byte | `CMD`、`LENGTH`、全`PAYLOAD`のXOR |
 
-### 2.2 `packet` — パケット構造体・チェックサム
+### 3.2 SPI通信
 
-#### データ構造
-
-```c
-#define PACKET_HEADER   0xAA
-#define PACKET_MAX_PAYLOAD  32
-
-typedef struct {
-    uint8_t header;           // 0xAA 固定
-    uint8_t cmd;              // コマンド ID
-    uint8_t length;           // ペイロード長 (0-32)
-    uint8_t payload[PACKET_MAX_PAYLOAD];
-    uint8_t checksum;         // XOR(cmd, length, payload[0..length-1])
-} Packet_t;
-```
-
-#### 主要関数
-
-| 関数 | シグネチャ | 説明 |
-|---|---|---|
-| `packet_build` | `void packet_build(Packet_t *p, uint8_t cmd, const uint8_t *payload, uint8_t len)` | パケット生成 + チェックサム計算 |
-| `packet_serialize` | `uint8_t packet_serialize(const Packet_t *p, uint8_t *buf)` | バイト列に変換、返値=バイト数 |
-| `packet_parse` | `bool packet_parse(const uint8_t *buf, uint8_t len, Packet_t *out)` | 受信バイト列を解析・検証 |
-| `packet_checksum` | `uint8_t packet_checksum(const Packet_t *p)` | チェックサム算出 |
-
----
-
-### 2.3 `uart_comm` — UART2 通信
-
-#### 状態遷移
-
-```
-IDLE → SENDING → WAIT_ACK → IDLE (ACK受信)
-                           → RETRY  (タイムアウト)
-                               → SENDING (リトライ回数 < 3)
-                               → ERROR   (リトライ回数 >= 3)
-```
-
-#### 主要関数
-
-| 関数 | シグネチャ | 説明 |
-|---|---|---|
-| `UartComm::begin` | `void begin()` | UART2 初期化 |
-| `UartComm::send` | `bool send(const Packet_t &p)` | 送信 + ACK 待ち（リトライあり） |
-| `UartComm::receive` | `bool receive(Packet_t &out)` | 受信パケット取得 |
-| `UartComm::update` | `void update()` | 受信バッファ処理（ループ内で呼ぶ） |
-| `UartComm::getErrorRate` | `float getErrorRate()` | 通信エラー率取得 |
-
----
-
-### 2.4 `spi_comm` — SPI1 Master 通信
-
-#### 主要関数
-
-| 関数 | シグネチャ | 説明 |
-|---|---|---|
-| `SpiComm::begin` | `void begin()` | SPI1 初期化 (最大 1MHz 初期) |
-| `SpiComm::transfer` | `bool transfer(const uint8_t *tx, uint8_t *rx, uint8_t len)` | フルデュプレックス転送 |
-| `SpiComm::sendPacket` | `bool sendPacket(const Packet_t &p)` | パケット送信 |
-
----
-
-### 2.5 `bt_controller` — Bluetooth コントローラー
-
-#### 状態遷移
-
-```
-INIT → PAIRING → CONNECTED → DISCONNECTED
-                    ↑              ↓
-                    └──RECONNECTING┘ (30秒タイムアウト)
-```
-
-#### コントローラーマッピング
-
-| 入力 | 処理 | 送信コマンド |
-|---|---|---|
-| 左スティック Y軸 | 速度算出（デッドゾーン ±5%） | CMD 0x01 |
-| 左スティック X軸 | ステアリング（ステッパ） | CMD 0x03 |
-| R2 トリガー | 速度倍率 | CMD 0x01 (補正) |
-| L2 トリガー | ブレーキ（speed=0）| CMD 0x02 |
-| × ボタン | 緊急停止 | CMD 0x04 |
-| △ ボタン | LED モード切替 | CMD 0x11 |
-| ○ ボタン | ハザードトグル | CMD 0x11 |
-| OPTIONS 長押し 3秒 | シャットダウン | CMD 0x30 |
-
-#### 主要関数
-
-| 関数 | シグネチャ | 説明 |
-|---|---|---|
-| `BtController::begin` | `void begin()` | BT 初期化・ペアリング開始 |
-| `BtController::update` | `void update()` | 入力取得・コマンド生成（ループ内） |
-| `BtController::isConnected` | `bool isConnected()` | 接続状態取得 |
-| `BtController::onDisconnect` | `void onDisconnect(cb_t cb)` | 切断コールバック登録 |
-
----
-
-### 2.6 `battery_monitor` — バッテリー監視
-
-#### 電圧レベル定義
-
-```
-// バッテリーレベルは動作状態（挙動の切り替え）を定義するものであり、
-// 残量(%)は電圧-残量マップから線形補間して算出する。
-// 以下のパーセンテージは各レベルの下限目安値（実際は補間値を使用）。
-FULL     : >= 12.0V (100%)   通常サンプリング 1s
-NORMAL   : >= 10.5V ( ~50%)  通常サンプリング 1s
-LOW      :  < 10.5V ( ~20%)  高速サンプリング 100ms + 警告LED点滅 + BT通知
-CRITICAL :  <  9.5V (  ~5%)  自動シャットダウン開始
-// 残量 % = (電圧 - 9.5V) / (12.0V - 9.5V) * 100 をクランプして算出
-```
-
-#### 主要関数
-
-| 関数 | シグネチャ | 説明 |
-|---|---|---|
-| `BatteryMonitor::begin` | `void begin()` | ADC 初期化 |
-| `BatteryMonitor::update` | `void update()` | 電圧取得・レベル判定（ループ内） |
-| `BatteryMonitor::getVoltage` | `float getVoltage()` | 現在電圧 (V) |
-| `BatteryMonitor::getLevel` | `BatLevel_t getLevel()` | FULL/NORMAL/LOW/CRITICAL |
-| `BatteryMonitor::getPercent` | `uint8_t getPercent()` | 残量 (%) |
-
----
-
-### 2.7 `power_manager` — 電源管理
-
-#### シャットダウンシーケンス
-
-```
-1. STM32 へ CMD 0x30 (シャットダウン通知) 送信
-2. CMD 0xF0 (シャットダウンACK) 受信待ち (タイムアウト 3秒)
-3. タイムアウト or ACK受信後
-4. GPIO_POW_ON = LOW → 電源遮断
-```
-
-#### 主要関数
-
-| 関数 | シグネチャ | 説明 |
-|---|---|---|
-| `PowerManager::begin` | `void begin()` | GPIO_POW_ON = HIGH (電源保持) |
-| `PowerManager::shutdown` | `void shutdown(ShutdownReason_t reason)` | シャットダウンシーケンス開始 |
-| `PowerManager::isShuttingDown` | `bool isShuttingDown()` | シャットダウン中フラグ |
-
----
-
-### 2.8 `debug_led` — デバッグ LED
-
-#### LED割当
-
-| LED | GPIO | 機能 |
-|---|---|---|
-| D7 | IO22 | 電源状態 |
-| D8 | IO23 | BT 接続 |
-| D9 | IO25 | UART 通信 |
-| D10 | IO26 | SPI 通信 |
-| D11 | IO27 | バッテリー警告 |
-| D12 | IO32 | エラー |
-| D13 | IO33 | ユーザー定義 |
-
-#### 主要関数
-
-| 関数 | シグネチャ | 説明 |
-|---|---|---|
-| `DebugLed::begin` | `void begin()` | GPIO 初期化 |
-| `DebugLed::startupSequence` | `void startupSequence()` | ナイトライダー演出（約1秒） |
-| `DebugLed::set` | `void set(LedId_t id, LedMode_t mode)` | ON/OFF/1Hz/4Hz 点滅設定 |
-| `DebugLed::update` | `void update()` | 点滅タイマ処理（ループ内） |
-
----
-
-## 3. STM32 モジュール設計
-
-### 3.1 `config.h` — グローバル定数・ピン定義
-
-```c
-/* ピン定義 */
-#define PIN_FRONT_LED_R     GPIO_PIN_0  // PA0
-#define PIN_FRONT_LED_L     GPIO_PIN_1  // PA1
-#define PIN_TB6575_FST      GPIO_PIN_1  // PB1
-#define PIN_TB6575_CW_CCW   GPIO_PIN_2  // PB2
-#define PIN_TB6575_FMAX     GPIO_PIN_3  // PB3
-#define PIN_TB6575_FGOUT    GPIO_PIN_4  // PB4
-#define PIN_6608_CK_A       GPIO_PIN_10 // PB10
-#define PIN_6608_CK_B       GPIO_PIN_11 // PB11
-#define PIN_6608_CCWA       GPIO_PIN_12 // PB12
-#define PIN_6608_CCWB       GPIO_PIN_13 // PB13
-#define PIN_6608_RESET_A    GPIO_PIN_14 // PB14
-#define PIN_6608_RESET_B    GPIO_PIN_15 // PB15
-#define PIN_6608_MO_A       GPIO_PIN_6  // PB6
-#define PIN_6608_MO_B       GPIO_PIN_7  // PB7
-
-/* タイミング */
-#define COMM_WATCHDOG_MS    1000
-#define MOTOR_REVERSE_DECEL_MS 100
-```
-
----
-
-### 3.2 `packet` — パケット（共通定義、C言語版）
-
-ESP32 側と同一の構造体・関数を C 言語で実装。
-
-```c
-typedef struct {
-    uint8_t header;
-    uint8_t cmd;
-    uint8_t length;
-    uint8_t payload[PACKET_MAX_PAYLOAD];
-    uint8_t checksum;
-} Packet_t;
-
-void     Packet_Build(Packet_t *p, uint8_t cmd, const uint8_t *payload, uint8_t len);
-uint8_t  Packet_Serialize(const Packet_t *p, uint8_t *buf);
-bool     Packet_Parse(const uint8_t *buf, uint8_t len, Packet_t *out);
-uint8_t  Packet_Checksum(const Packet_t *p);
-```
-
----
-
-### 3.3 `uart_comm` — USART2 (STM32側)
-
-- USART2 を DMA 受信 + 割込送信で実装
-- 受信完了後にコマンドハンドラへディスパッチ
-- ACK/NACK を即時返送
-
-#### コマンドハンドラ登録テーブル
-
-```c
-typedef void (*CmdHandler_t)(const Packet_t *pkt);
-
-static const struct {
-    uint8_t       cmd;
-    CmdHandler_t  handler;
-} cmd_table[] = {
-    { 0x01, handle_motor_speed    },
-    { 0x02, handle_motor_stop     },
-    { 0x03, handle_stepper_ctrl   },
-    { 0x04, handle_emergency_stop },
-    { 0x10, handle_status_req     },
-    { 0x11, handle_led_mode       },
-    { 0x12, handle_led_brightness },
-    { 0x20, handle_sensor_req     },
-    { 0x30, handle_shutdown       },
-    { 0x40, handle_debug_led      },
-};
-```
-
----
-
-### 3.3.1 `spi_comm` — SPI1 Slave 通信 (STM32側)
-
-ESP32 (Master) からの SPI コマンドを受信し、コマンドハンドラへディスパッチする。
-UART と同一のパケットプロトコルを使用する。
-
-#### SPI1 設定
-
-| 項目 | 値 |
+| 項目 | 設定 |
 |---|---|
-| 動作モード | Slave |
-| NSS | PA4 (ハードウェア NSS) |
-| SCK | PA5 |
-| MISO | PA6 |
-| MOSI | PA7 |
-| クロック | 最大 10MHz（ESP32 Master 側で設定） |
-| データサイズ | 8bit |
-| CPOL/CPHA | 0/0 (Mode 0) |
-| 受信方式 | DMA (リングバッファ) |
+| Master | ESP32 |
+| Slave | STM32 |
+| クロック | 1 MHz |
+| SPIモード | Mode 0（CPOL=0、CPHA=0） |
+| 応答読取り用パディング | 64 byte |
 
-#### 受信フロー
+ESP32はコマンドパケットの後ろに`0x00`のパディングを付け、同一CS期間内で送信する。
+STM32はSPI1受信割り込みでパケットを受信・解析し、パディング期間中にACK（`0x80`）またはNACK（`0x81`）を返す。メインループの`SPI_Slave_Poll()`はNSS立上り後のフレーム状態初期化だけを行う。
 
+通常コマンド成功時のACKペイロードは、受信した元CMDの1 byteとする。未知コマンド、ペイロード長異常、値範囲外の場合はNACKを返し、ペイロードを`[元CMD][エラーコード]`の2 byteとする。
+
+| エラーコード | 内容 |
+|---:|---|
+| `0x01` | 未知コマンド |
+| `0x02` | パケット解析失敗、ペイロード長異常、値範囲外 |
+
+---
+
+## 4. ESP32側モーター制御
+
+### 4.1 PS3入力
+
+PS3イベントコールバックでは、次の2軸だけをモーター制御に使用する。
+
+| 入力 | 値の範囲 | 用途 |
+|---|---:|---|
+| 左スティックY軸 `ly` | `-128`〜`127` | 前進・後退。上方向が負値 |
+| 右スティックX軸 `rx` | `-128`〜`127` | 左旋回・右旋回。右方向が正値 |
+
+スティック値はミューテックスで保護した共有変数に保存し、50 ms周期のモーター制御タスクから読み出す。
+
+### 4.2 デッドゾーン
+
+各軸は絶対値が`20`未満の場合に`0`として扱う。
+
+```text
+abs(value) < 20  ->  0
+それ以外         ->  value
 ```
-NSS Low (ESP32がCSアサート)
-    │
-    ▼
-SPI DMA 受信開始
-    │
-    ▼
-NSS High (転送完了)
-    │
-    ▼
-パケット解析 (Packet_Parse)
-    │
-    ├─ 正常 → コマンドハンドラへディスパッチ（cmd_table と共通）
-    │         → MISO 経由で ACK (0x80) 返送
-    │
-    └─ エラー → MISO 経由で NACK (0x81) 返送
+
+### 4.3 前後・旋回成分の算出
+
+左スティックY軸は上方向が負値のため、符号を反転して前後成分を作る。
+
+```text
+forward = -deadzone(ly)
+turn    =  deadzone(rx)
 ```
 
-#### SPI コマンド定義（デバッグ LED 制御）
+### 4.4 左右モーター指令値の合成
 
-| CMD | 名称 | ペイロード | 説明 |
+```text
+motor_a = clamp(forward + turn, -128, 128)  // 左モーター
+motor_b = clamp(forward - turn, -128, 128)  // 右モーター
+```
+
+| 操作 | Motor A指令 | Motor B指令 | 動作 |
+|---|---:|---:|---|
+| 左スティック上、右スティック中央 | 正 | 正 | 前進 |
+| 左スティック下、右スティック中央 | 負 | 負 | 後退 |
+| 右スティック右 | 増加 | 減少 | 右旋回成分を加算 |
+| 右スティック左 | 減少 | 増加 | 左旋回成分を加算 |
+| 両軸がデッドゾーン内 | - | - | 両モーター停止コマンド |
+
+左スティックを上に倒し、右スティックが中央の場合、Motor AとMotor Bには同じ正の指令値が生成される。
+ESP32はMotor A、Motor Bの順に速度設定コマンドを1回ずつ送信する。
+
+### 4.5 方向・速度への変換
+
+合成後の指令値から、方向と速度を次のように生成する。
+
+```text
+value >= 0  -> direction = 0x00（正転）
+value <  0  -> direction = 0x01（逆転）
+
+speed = abs(value) * 1000 / 128
+```
+
+速度は`0`〜`1000`の整数で送信する。
+
+### 4.6 制御周期と切断時動作
+
+| 条件 | 処理 |
+|---|---|
+| PS3接続中 | 50 ms周期（20 Hz）で入力を評価してコマンド送信 |
+| 両軸がデッドゾーン内 | `CMD_MOTOR_STOP`を両ch指定で送信 |
+| PS3切断検出 | 切断直後に1回だけ`CMD_MOTOR_STOP`を両ch指定で送信 |
+
+### 4.7 主要関数
+
+| 関数 | 引数 | 戻り値 | 処理 |
 |---|---|---|---|
-| 0x40 | DEBUG_LED_SET | `[led_mask(1byte)][mode(1byte)]` | ビットマスクで指定した LED の ON/OFF/点滅を設定 |
+| `apply_deadzone` | PS3軸値 | デッドゾーン適用後の値 | 絶対値20未満を0にする |
+| `clamp_motor_input` | 合成後の指令値 | `-128`〜`128`に制限した値 | オーバーフローを防ぐ |
+| `send_motor_speed` | チャンネル、符号付き指令値 | なし | 方向と0〜1000の速度へ変換してSPI送信する |
+| `ps3_event_cb` | PS3状態、イベント | なし | 左Y軸と右X軸を共有変数へ保存する |
+| `motor_task` | FreeRTOSタスク引数（未使用） | 戻らない | 20 Hzで接続状態と入力を評価し、モーターコマンドを送信する |
 
-**led_mask ビット割当:**
+### 4.8 ▲ボタンとヘッドライト
 
-| Bit | LED | GPIO |
+▲の`button_down`イベントごとに、左右ヘッドライトの光量indexを次へ進める。
+
+```text
+0% -> 10% -> 25% -> 50% -> 70% -> 0%
+```
+
+イベントコールバックは共有状態だけを更新する。SPI送信は50 ms周期の`motor_task`から`CMD_LED_BRIGHTNESS`で行い、ACK以外の場合は次周期に再送する。PS3切断時は光量0%を送信し、indexを0へ戻す。
+
+---
+
+## 5. モーターコマンド仕様
+
+### 5.1 速度設定 `CMD_MOTOR_SPEED`（`0x01`）
+
+ペイロード長は4 byteとする。
+
+```text
+[channel][direction][speed_H][speed_L]
+```
+
+| フィールド | 値 | 内容 |
 |---|---|---|
-| bit0 | D0 | PC10 |
-| bit1 | D1 | PC11 |
-| bit2 | D2 | PC12 |
-| bit3 | D3 | PC13 |
-| bit4 | D4 | PC14 |
-| bit5 | D5 | PC15 |
+| `channel` | `0x00` | Motor A（左） |
+|  | `0x01` | Motor B（右） |
+|  | `0xFF` | 両チャンネル |
+| `direction` | `0x00` | 正転 |
+|  | `0x01` | 逆転 |
+|  | `0x02` | ブレーキ |
+| `speed` | `0`〜`1000` | 16 bit、ビッグエンディアン |
 
-**mode 値:**
+STM32は`speed`が`1000`を超えた場合、コマンドを実行せずエラーコード`0x02`のNACKを返す。
 
-| 値 | 動作 |
+### 5.2 通常停止 `CMD_MOTOR_STOP`（`0x02`）
+
+```text
+[channel]
+```
+
+| `channel` | 対象 |
 |---|---|
-| 0x00 | OFF |
-| 0x01 | ON |
-| 0x02 | 1Hz 点滅 |
-| 0x03 | 4Hz 点滅 |
+| `0x00` | Motor A |
+| `0x01` | Motor B |
+| `0xFF` | 両チャンネル |
 
-#### 主要関数
+通常停止では対象チャンネルの目標速度を`0`、目標方向をブレーキへ変更する。
+現在速度は周期更新処理によって段階的に`0`へ減速する。
 
-| 関数 | シグネチャ | 説明 |
+### 5.3 緊急停止 `CMD_EMERGENCY_STOP`（`0x04`）
+
+両チャンネルの目標速度と現在速度を直ちに`0`へ設定し、TIM8 CH1〜CH4の比較値を`0`にする。
+さらに駆動許可信号をLOWにして、Hブリッジ回路への出力を停止する。
+
+### 5.4 シャットダウン `CMD_SHUTDOWN`（`0x30`）
+
+ペイロード長は0 byteとする。STM32は両モーターを緊急停止し、通常LEDとデバッグLEDを消灯した後、ペイロードなしの`CMD_SHUTDOWN_ACK`（`0xF0`）を返す。
+
+### 5.5 ヘッドライト光量 `CMD_LED_BRIGHTNESS`（`0x12`）
+
+```text
+[side][brightness_percent]
+```
+
+| フィールド | 値 | 内容 |
 |---|---|---|
-| `SPI_Slave_Init` | `void SPI_Slave_Init(void)` | SPI1 Slave + DMA 初期化、受信バッファ準備 |
-| `SPI_Slave_StartReceive` | `void SPI_Slave_StartReceive(void)` | DMA 受信開始（NSS 割込連動） |
-| `SPI_Slave_Dispatch` | `void SPI_Slave_Dispatch(const uint8_t *buf, uint8_t len)` | 受信パケット解析 → cmd_table ハンドラ呼出 |
-| `SPI_Slave_SendResponse` | `HAL_StatusTypeDef SPI_Slave_SendResponse(const Packet_t *p)` | MISO 経由で応答パケット送信 |
+| `side` | `0x00` | 右ヘッドライト |
+|  | `0x01` | 左ヘッドライト |
+|  | `0xFF` | 左右両方 |
+| `brightness_percent` | `0〜100` | PWMデューティ[%] |
+
+STM32はTIM2 CH1/CH2の1 kHz PWMへ即時反映する。PS3の▲操作では`side=0xFF`を使用する。
 
 ---
 
-### 3.3.2 `debug_led` — デバッグ LED (STM32側)
+## 6. STM32側Hブリッジ制御
 
-STM32 の PC10〜PC15 に接続されたデバッグ LED を制御する。
-ESP32 から SPI 経由で受信した CMD 0x40 コマンドに応じて各 LED の状態を更新する。
+### 6.1 出力ピン
 
-#### ピン構成
+| モーター | Hブリッジ入力 | STM32ピン | タイマ出力 |
+|---|---|---|---|
+| Motor A（左） | IN1 | PC6 | TIM8_CH1 |
+| Motor A（左） | IN2 | PC7 | TIM8_CH2 |
+| Motor B（右） | IN1 | PC8 | TIM8_CH3 |
+| Motor B（右） | IN2 | PC9 | TIM8_CH4 |
+| 共通 | 駆動許可 | PC2 | GPIO Output |
 
-| LED | GPIO | 説明 |
-|---|---|---|
-| D0 | PC10 | デバッグ LED 0 |
-| D1 | PC11 | デバッグ LED 1 |
-| D2 | PC12 | デバッグ LED 2 |
-| D3 | PC13 | デバッグ LED 3 |
-| D4 | PC14 | デバッグ LED 4 |
-| D5 | PC15 | デバッグ LED 5 |
-
-#### LED モード定義
-
-```c
-typedef enum {
-    DBG_LED_OFF    = 0x00,
-    DBG_LED_ON     = 0x01,
-    DBG_LED_BLINK_1HZ = 0x02,
-    DBG_LED_BLINK_4HZ = 0x03,
-} DebugLedMode_t;
-
-typedef struct {
-    GPIO_TypeDef   *port;
-    uint16_t        pin;
-    DebugLedMode_t  mode;
-    uint8_t         state;       // 現在の出力状態 (0/1)
-} DebugLed_t;
-```
-
-#### 主要関数
-
-| 関数 | シグネチャ | 説明 |
-|---|---|---|
-| `DebugLed_Init` | `void DebugLed_Init(void)` | PC10〜PC15 を GPIO 出力に初期化、全 LED OFF |
-| `DebugLed_Set` | `void DebugLed_Set(uint8_t led_mask, DebugLedMode_t mode)` | ビットマスクで指定した LED のモード設定 |
-| `DebugLed_Update` | `void DebugLed_Update(void)` | 点滅タイマ処理（メインループ内で周期的に呼出） |
-| `DebugLed_AllOff` | `void DebugLed_AllOff(void)` | 全 LED 消灯 |
-
-#### コマンドハンドラ
-
-```c
-static void handle_debug_led(const Packet_t *pkt)
-{
-    if (pkt->length < 2) return;
-    uint8_t led_mask = pkt->payload[0];
-    DebugLedMode_t mode = (DebugLedMode_t)pkt->payload[1];
-    DebugLed_Set(led_mask, mode);
-}
-```
-
-#### 主要関数
-
-| 関数 | シグネチャ | 説明 |
-|---|---|---|
-| `UART_Init` | `void UART_Init(void)` | USART2 + DMA 初期化 |
-| `UART_Send` | `HAL_StatusTypeDef UART_Send(const Packet_t *p)` | パケット送信 |
-| `UART_Dispatch` | `void UART_Dispatch(const uint8_t *buf, uint8_t len)` | 受信ハンドラ呼出 |
-| `UART_CheckWatchdog` | `void UART_CheckWatchdog(void)` | 通信途絶1秒検知→全停止 |
-
----
-
-### 3.4 `motor_dc` — DC モーター制御 (TB6575)
-
-#### ピン構成
-
-| 信号 | MCU ピン | 方向 |
-|---|---|---|
-| PWM | PB0 (TIM3_CH3) | OUT |
-| FST | PB1 | OUT |
-| CW_CCW | PB2 | OUT |
-| FMAX | PB3 | OUT |
-| FGOUT | PB4 (TIM IC) | IN |
-
-#### 状態遷移（方向転換）
-
-```
-RUNNING_CW
-    │ 逆転指令
-    ▼
-DECELERATING  (0まで減速, 最大100ms)
-    │
-    ▼
-STOPPED       (20ms 待機)
-    │
-    ▼
-RUNNING_CCW
-```
-
-#### 主要関数
-
-| 関数 | シグネチャ | 説明 |
-|---|---|---|
-| `MotorDC_Init` | `void MotorDC_Init(void)` | TIM3_CH3 PWM + GPIO 初期化 |
-| `MotorDC_SetSpeed` | `void MotorDC_SetSpeed(uint8_t dir, uint16_t speed)` | dir=0:CW, 1:CCW, speed=0-1000 |
-| `MotorDC_Stop` | `void MotorDC_Stop(void)` | デューティ 0 → 停止 |
-| `MotorDC_GetRPM` | `uint16_t MotorDC_GetRPM(void)` | FGOUT パルスから RPM 算出 |
-| `MotorDC_Update` | `void MotorDC_Update(void)` | 台形加減速・方向転換シーケンス処理 |
-
----
-
-### 3.5 `motor_stepper` — ステッピングモーター制御 (TB6608)
-
-#### ピン構成
-
-| 信号 | MCU ピン | 軸 |
-|---|---|---|
-| CK_A | PB10 | A |
-| CK_B | PB11 | B |
-| CW_CCW_A | PB12 | A |
-| CW_CCW_B | PB13 | B |
-| RESET_A | PB14 | A |
-| RESET_B | PB15 | B |
-| MO_A | PB6 (IN) | A |
-| MO_B | PB7 (IN) | B |
-
-#### パルス生成（タイマ割込）
-
-- TIM を使用してパルスをタイマ割込で生成
-- メインループをブロックしない
-- 台形加減速: 加速→定速→減速の 3 フェーズ
-
-#### 主要関数
-
-| 関数 | シグネチャ | 説明 |
-|---|---|---|
-| `Stepper_Init` | `void Stepper_Init(void)` | GPIO + タイマ初期化 |
-| `Stepper_Move` | `void Stepper_Move(StepperAxis_t axis, int32_t steps, uint16_t speed)` | 指定ステップ移動（非ブロッキング） |
-| `Stepper_Stop` | `void Stepper_Stop(StepperAxis_t axis)` | 即時停止 |
-| `Stepper_Home` | `void Stepper_Home(StepperAxis_t axis)` | 原点復帰 |
-| `Stepper_GetStatus` | `StepperStatus_t Stepper_GetStatus(StepperAxis_t axis)` | 動作状態取得 |
-| `Stepper_IRQHandler` | `void Stepper_IRQHandler(void)` | タイマ割込ハンドラ（パルス生成） |
-
----
-
-### 3.6 `sensor_mpu6050` — 加速度・ジャイロセンサ (MPU6050)
-
-#### I2C 設定
+### 6.2 PWM設定
 
 | 項目 | 値 |
+|---|---:|
+| タイマ | TIM8 |
+| PWM周波数 | 20 kHz |
+| Prescaler | 0 |
+| Auto Reload Register | 3199（SystemCoreClock = 64 MHz時） |
+| 指令速度 | 0〜1000 |
+
+速度指令から比較値への変換は次式とする。
+
+```text
+CCR = speed * ARR / 1000
+```
+
+`CCR`が`ARR`以上になる場合は`ARR - 1`へ制限する。
+
+### 6.3 Hブリッジ入力
+
+| 指令方向 | IN1 | IN2 | 動作 |
+|---|---|---|---|
+| 正転（`0x00`） | LOW | PWM | 正転駆動 |
+| 逆転（`0x01`） | PWM | LOW | 逆転駆動 |
+| ブレーキ（`0x02`） | LOW | LOW | ブレーキ停止 |
+
+Motor AはTIM8 CH1/CH2、Motor BはTIM8 CH3/CH4へ同じ規則を適用する。
+
+### 6.4 モーター状態
+
+各チャンネルは次の状態を個別に保持する。
+
+| 状態 | 内容 |
 |---|---|
-| I2C アドレス | 0x68 (AD0=LOW) または 0x69 |
-| サンプリング | 100Hz (10ms 周期) |
-| 通信速度 | Fast mode (400kHz) |
+| `target_direction` | SPIコマンドで指定された目標方向 |
+| `current_direction` | 現在PWM出力へ反映している方向 |
+| `target_speed` | SPIコマンドで指定された目標速度 |
+| `current_speed` | 現在PWM出力へ反映している速度 |
+| `reverse_tick` | 反転シーケンス開始時刻 |
+| `reversing` | 反転処理中フラグ |
 
-#### センサデータ構造体
+### 6.5 加減速処理
 
-```c
-typedef struct {
-    int16_t accel_x, accel_y, accel_z;  // 加速度 (raw)
-    int16_t gyro_x,  gyro_y,  gyro_z;   // ジャイロ (raw)
-    int16_t temp;                         // 温度 (raw)
-    float   roll, pitch;                  // 姿勢角 (deg) - 相補フィルタ
-} MPU6050_Data_t;
+メインループから周期更新処理を呼び、各呼出しで現在速度を目標速度へ最大`50`ずつ近づける。
+
+```text
+current_speed < target_speed  -> 最大50加速
+current_speed > target_speed  -> 最大50減速
 ```
 
-#### 主要関数
+### 6.6 方向反転処理
 
-| 関数 | シグネチャ | 説明 |
-|---|---|---|
-| `MPU6050_Init` | `HAL_StatusTypeDef MPU6050_Init(void)` | I2C 疎通確認 + レジスタ設定 |
-| `MPU6050_Read` | `HAL_StatusTypeDef MPU6050_Read(MPU6050_Data_t *data)` | 全データ取得 |
-| `MPU6050_Calibrate` | `void MPU6050_Calibrate(void)` | オフセット補正（静止状態で実行） |
-| `MPU6050_UpdateAttitude` | `void MPU6050_UpdateAttitude(MPU6050_Data_t *data, float dt)` | 相補フィルタ（roll/pitch更新） |
-| `MPU6050_CheckFallDetect` | `bool MPU6050_CheckFallDetect(const MPU6050_Data_t *data)` | 転倒検知（閾値判定） |
+回転中に正転・逆転が切り替わった場合は、次の順序で処理する。
 
----
-
-### 3.7 `led_control` — ヘッドライト LED 制御
-
-#### ピン構成
-
-| 信号 | MCU ピン | 説明 |
-|---|---|---|
-| FRONT_LED_R | PA0 (TIM PWM) | 右ヘッドライト |
-| FRONT_LED_L | PA1 (TIM PWM) | 左ヘッドライト |
-
-#### LED モード定義
-
-```c
-typedef enum {
-    LM_OFF      = 0x00,
-    LM_LOW      = 0x01,
-    LM_HIGH     = 0x02,
-    LM_AUTO     = 0x03,
-    LM_ADAPTIVE = 0x04,
-    LM_BRAKE    = 0x05,
-    LM_HAZARD   = 0x06,
-    LM_TURN_L   = 0x07,
-    LM_TURN_R   = 0x08,
-    LM_BREATH   = 0x09,
-    LM_STROBE   = 0x0A,
-    LM_WELCOME  = 0x0B,
-    LM_BATTERY  = 0x0C,
-} LedMode_t;
-```
-
-#### 主要関数
-
-| 関数 | シグネチャ | 説明 |
-|---|---|---|
-| `LED_Init` | `void LED_Init(void)` | TIM PWM 初期化 |
-| `LED_SetMode` | `void LED_SetMode(LedMode_t mode)` | モード設定 |
-| `LED_SetBrightness` | `void LED_SetBrightness(LedSide_t side, uint8_t brightness)` | 輝度設定 (0-100%) |
-| `LED_Update` | `void LED_Update(void)` | 点滅タイマ・フェード処理（ループ内） |
-| `LED_WelcomeSequence` | `void LED_WelcomeSequence(void)` | 起動演出（1回のみ） |
-
----
-
-## 4. 通信シーケンス図
-
-### 4.1 通常コマンド送受信
-
-```
-ESP32                           STM32
-  │                               │
-  │── CMD 0x01 (モーター速度) ───→│
-  │                               │ PWM 更新
-  │←── CMD 0x80 (ACK) ───────────│
-  │                               │
-```
-
-### 4.2 センサデータ取得
-
-```
-ESP32                           STM32
-  │                               │
-  │── CMD 0x20 (センサ要求) ─────→│
-  │                               │ MPU6050 読取
-  │←── CMD 0x91 (センサ応答) ────│
-  │    [ax_H][ax_L]...[gz_L]      │
-```
-
-### 4.3 転倒検知フロー
-
-```
-STM32 (MPU6050)                 ESP32
-  │ 転倒検知                     │
-  │── CMD 0x92 (転倒通知) ──────→│
-  │                               │ LED警告 + BT通知
-  全モーター即時停止              │
-```
-
-### 4.4 シャットダウンシーケンス
-
-```
-ESP32                           STM32
-  │── CMD 0x30 (シャットダウン) →│
-
-```
-
-### 4.5 SPI デバッグ LED 制御
-
-```
-ESP32 (SPI Master)              STM32 (SPI Slave)
-  │                               │
-  │  NSS Low                      │
-  │── SPI CMD 0x40 ─────────────→│
-  │   [0xAA][0x40][0x02]          │
-  │   [led_mask][mode][checksum]  │
-  │                               │ DebugLed_Set(led_mask, mode)
-  │←── SPI ACK 0x80 ────────────│
-  │  NSS High                     │
-```
-  │                               │ モーター停止
-  │                               │ LED消灯
-  │←── CMD 0xF0 (ACK) ──────────│
-  │ (タイムアウト 3秒)            │
-  │                               │
-  GPIO_POW_ON = LOW              │
-  (電源遮断)                      │
+```text
+反転指令検出
+    |
+    v
+現在速度を50ずつ減速
+    |
+    v
+速度0、かつ反転検出から100 ms以上経過
+    |
+    v
+出力方向を切替
+    |
+    v
+新しい目標速度へ50ずつ加速
 ```
 
 ---
 
-## 5. タスク/割込優先度（STM32）
+## 7. 前進時の処理例
 
-| 優先度 | 処理 | 実装 |
-|---|---|---|
-| 最高 (0) | 緊急停止 (EStop) | EXTI or UART割込 |
-| 高 (1) | ステッパパルス生成 | TIM 割込 |
-| 高 (1) | USART2 受信 DMA | DMA 割込 |
-| 中 (2) | MPU6050 読取 (100Hz) | TIM 周期割込 |
-| 中 (2) | DC モーター更新 | TIM 周期割込 |
-| 低 (3) | LED 更新 | メインループ / TIM |
-| 低 (4) | IWDG リフレッシュ | メインループ |
+左スティックを上いっぱい、右スティックを中央にした場合の例を示す。
+
+```text
+PS3入力
+  ly = -128
+  rx = 0
+
+ESP32演算
+  forward = 128
+  turn    = 0
+  motor_a = 128
+  motor_b = 128
+
+SPI送信
+  Motor A: CMD=0x01, payload=[0x00][0x00][0x03][0xE8]
+  Motor B: CMD=0x01, payload=[0x01][0x00][0x03][0xE8]
+
+STM32出力
+  Motor A: PC6=LOW、PC7=20 kHz PWM
+  Motor B: PC8=LOW、PC9=20 kHz PWM
+```
+
+左右の速度指令はいずれも`1000`となり、両モーターが同じ方向・同じデューティで駆動される。
 
 ---
 
-## 6. メモリ・リソース見積もり（STM32G473RCTx）
+## 8. センサー取得・ESP32モニタリング設計
 
-| リソース | 見積もり | 上限 |
-|---|---|---|
-| Flash | 〜64KB | 256KB |
-| RAM (SRAM) | 〜20KB | 96KB |
-| タイマ使用数 | 4 (TIM1,3,4,6) | 11 |
-| I2C チャネル | 1 | 3 |
-| SPI チャネル | 1 (Slave) | 3 |
-| USART チャネル | 1 (USART2) | 5 |
-| DMA チャネル | 4 (USART2 RX/TX + SPI1 RX/TX) | 16 |
+### 8.1 データ経路
 
----
+```text
+ICM-20948（加速度・ジャイロ・AK09916地磁気）/ BMP280
+        | I2C1 100 kHz（PA15=SCL、PA14=SDA）
+        v
+STM32 外部センサー管理
+        | 最新値をスナップショット化
+        | CMD_SENSOR_RESP（0x91、Version 2、32 byte）
+        v
+ESP32 SPIセンサタスク（10 Hz）
+        | /api/sensors（JSON）
+        v
+Webブラウザ（100 ms周期更新、9軸数値・3つの30秒グラフ）
+```
 
-## 7. 変更履歴
+I2C取得はモーター処理と分離する。STM32はICM-20948の加速度・ジャイロ・地磁気を10 ms、BMP280を100 ms周期でポーリングし、SPI要求時はI2Cアクセスを行わず最新スナップショットを返す。AK09916はICM-20948内部I2Cマスターで100 Hz連続測定する。センサー異常はモーター停止条件にしない。
+
+### 8.2 I2C1
+
+| 項目 | 設定 |
+|---|---|
+| SCL | `PA15 / I2C1_SCL / AF4` |
+| SDA | `PA14 / I2C1_SDA / AF4` |
+| 速度 | 100 kHz |
+| GPIO | オープンドレイン、内部プルアップなし |
+| タイムアウト | 10 ms |
+| デバッグ | SWD/JTAGを使用しない。PA14をデバッグ用に予約しない |
+
+### 8.3 STM32モジュール
+
+| モジュール | 主な処理 |
+|---|---|
+| `icm20948.c` | ICM識別、±4 g加速度、±500 deg/sジャイロ、AK09916内部I2C制御、9軸単位変換 |
+| `bmp280.c` | アドレス探索、識別、個体別校正値取得、温度・気圧補正 |
+| `external_sensors.c` | 周期ポーリング、有効状態、連続エラー、1秒間隔の再初期化 |
+| `spi_comm.c` | `CMD_SENSOR_REQ`を処理しVersion 2、固定32 byte応答を生成 |
+
+### 8.4 SPIセンサペイロード
+
+`CMD_SENSOR_REQ(0x20)`に対し、`CMD_SENSOR_RESP(0x91)`で次を返す。複数byte値はビッグエンディアンとする。
+
+| Offset | 内容 |
+|---:|---|
+| 0 | バージョン`0x02` |
+| 1 | 状態（加速度・環境・ジャイロ・地磁気の有効/異常bit） |
+| 2～3 | シーケンス番号 |
+| 4～7 | STM32取得時刻ms |
+| 8～13 | 加速度X/Y/Z、各`int16_t`、mg |
+| 14～19 | ジャイロX/Y/Z、各`int16_t`、0.1 deg/s |
+| 20～25 | 地磁気X/Y/Z、各`int16_t`、0.1 µT |
+| 26～27 | 温度`int16_t`、0.01 ℃ |
+| 28～31 | 気圧`uint32_t`、Pa |
+
+### 8.5 ESP32モジュール
+
+| クラス・関数 | 処理 | 引数 | 戻り値 |
+|---|---|---|---|
+| `SensorMonitor::begin` | 10 HzのSPI取得タスクを開始 | 初期化済み`SpiComm` | タスク開始成否 |
+| `SensorMonitor::getSnapshot` | 排他制御して最新値をコピー | 出力先 | コピー成否 |
+| `SensorMonitor::decodeResponse` | Version 2の32 byteペイロードを検証・変換 | 受信パケット、出力先 | 形式が有効なら`true` |
+| `SensorWebServer::begin` | SoftAPとHTTPサーバーを開始 | `SensorMonitor` | `esp_err_t` |
+| `SensorWebServer::apiHandler` | 最新値をJSONで返す | HTTP要求 | `esp_err_t` |
+
+モータータスクとセンサータスクは同じSPIマスターを使用するため、`SpiComm`内部のFreeRTOS mutexでトランザクション単位に排他制御する。
+
+### 8.6 Webモニター
+
+| 項目 | 仕様 |
+|---|---|
+| SoftAP SSID | `CataProbot-Monitor` |
+| パスワード | `cataprobot` |
+| URL | `http://192.168.4.1/` |
+| API | `GET /api/sensors` |
+| ブラウザ更新 | 100 ms |
+| 表示 | 9軸、温度、気圧、個別状態、シーケンス、取得時刻、経過時間、SPIエラー数 |
+| グラフ | 直近30秒の加速度・ジャイロ・地磁気 |
+
+## 9. ヘッドライト・バッテリー表示設計
+
+### 9.1 ヘッドライトPWM
+
+| 項目 | 仕様 |
+|---|---|
+| 右 / 左出力 | PA0 / PA1 |
+| タイマ | TIM2 CH1 / CH2 |
+| PWM周波数 | 1 kHz |
+| 光量範囲 | 0〜100% |
+| ▲操作光量 | 10、25、50、70、0% |
+
+### 9.2 12Vバッテリー表示
+
+ESP32はGPIO34で12Vバイク用鉛バッテリーを200 ms周期で測定する。4回平均後の電圧からPS3 Player LEDを決定する。
+
+| 電圧 | Player LED |
+|---:|---|
+| `12.6 V`以上 | Player 4 |
+| `12.4 V`以上、`12.6 V`未満 | Player 3 |
+| `12.1 V`以上、`12.4 V`未満 | Player 2 |
+| `12.1 V`未満 | Player 1 |
+
+境界には100 mVのヒステリシスを適用する。電圧基準はYuasa Powersports Battery Technical Manualの開放電圧表とし、走行中の表示は負荷電圧による目安とする。
+
+- https://www.yuasabatteries.com/wp-content/uploads/2017/07/TechManual.x78244.pdf
+
+## 10. 変更履歴
 
 | バージョン | 日付 | 変更内容 |
 |---|---|---|
-| 1.0 | 2026-03-21 | 初版作成 |
+| 2.0 | 2026-07-23 | 実機確認済みのPS3入力、SPIコマンド、2ch Hブリッジモーター駆動仕様へ全面更新 |
+| 2.1 | 2026-07-23 | ICM-20948・BMP280取得、SPIセンサー応答、ESP32 Webモニター設計を追加 |
+| 2.3 | 2026-07-23 | SPI受信を割り込み化し、応答paddingを64 byteへ拡張 |
+| 3.0 | 2026-07-24 | ICM-20948を9軸化し、SPI Version 2・32 byte・Web 3グラフへ更新 |
+| 2.2 | 2026-07-23 | SPI応答・シャットダウンを実装仕様へ統一し、Hブリッジ名称、32 byte padding、100 ms反転待ち、ブレーキ停止仕様へ更新 |
+| 2.3 | 2026-07-23 | ▲によるヘッドライト光量切替、切断時消灯、12V鉛バッテリーPlayer LED表示を追加 |
