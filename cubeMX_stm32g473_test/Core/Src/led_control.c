@@ -1,9 +1,9 @@
 #include "led_control.h"
 #include "config.h"
 
-/* ---------- 定数 ---------- */
-#define LED_PWM_PSC         63      /* 64MHz / 64 = 1MHz */
-#define LED_PWM_ARR         999     /* 1MHz / 1000 = 1kHz PWM */
+/* 64 MHzのTIM2から1 kHz PWMを作る設定と各点灯周期。 */
+#define LED_PWM_PSC         63      /* 64 MHz / 64 = 1 MHz。 */
+#define LED_PWM_ARR         999     /* 1 MHz / 1000 = 1 kHz PWM。 */
 #define LED_BRIGHTNESS_MAX  100
 
 #define LED_LOW_PERCENT     30
@@ -12,30 +12,34 @@
 #define HAZARD_PERIOD_MS    500
 #define TURN_PERIOD_MS      500
 #define STROBE_PERIOD_MS    100
-#define BREATH_PERIOD_MS    3000    /* 1 サイクル 3 秒 */
+#define BREATH_PERIOD_MS    3000    /* 呼吸点灯1周期は3秒。 */
 #define WELCOME_STEP_MS     80
 #define WELCOME_STEPS       12
 
-/* ---------- 内部変数 ---------- */
+/* 現在の点灯モード、PWM光量、アニメーション位置。 */
 static TIM_HandleTypeDef *s_htim;
 static LedMode_t  s_mode        = LM_OFF;
-static LedMode_t  s_base_mode   = LM_OFF;   /* 自動割込復帰先 */
-static uint8_t    s_override    = 0;         /* ブレーキ等の自動割込中フラグ */
-static uint8_t    s_brightness_r = 0;        /* 0-100 */
-static uint8_t    s_brightness_l = 0;        /* 0-100 */
+static LedMode_t  s_base_mode   = LM_OFF;   /* 自動割り込み終了後に戻すモード。 */
+static uint8_t    s_override    = 0;         /* ブレーキなどの自動割り込み中を表す。 */
+static uint8_t    s_brightness_r = 0;        /* 右ライトの光量[0～100%]。 */
+static uint8_t    s_brightness_l = 0;        /* 左ライトの光量[0～100%]。 */
 static uint32_t   s_last_tick   = 0;
 static uint8_t    s_blink_state = 0;
 static uint16_t   s_breath_phase = 0;        /* 0 〜 BREATH_PERIOD_MS */
 static uint8_t    s_welcome_step = 0;
 static uint8_t    s_welcome_done = 0;
 
-/* ---------- 正弦波近似テーブル (0-255, 四半波 16 エントリ) ---------- */
+/* 呼吸点灯で使う0から255の正弦波1/4周期近似値。 */
 static const uint8_t s_sine_quarter[17] = {
     0, 25, 50, 74, 98, 120, 142, 162,
     180, 197, 212, 225, 236, 244, 250, 254, 255
 };
 
-/* ---------- 内部ヘルパ ---------- */
+/**
+ * @brief 0から100%の光量をTIM2比較値へ変換する。
+ * @param pct 光量[%]。
+ * @return TIM2へ設定する比較値。
+ */
 static uint16_t percent_to_ccr(uint8_t pct)
 {
     if (pct == 0)   return 0;
@@ -43,12 +47,24 @@ static uint16_t percent_to_ccr(uint8_t pct)
     return (uint16_t)((uint32_t)pct * LED_PWM_ARR / 100);
 }
 
+/**
+ * @brief 右と左のPWM比較値をTIM2へ書き込む。
+ * @param ccr_r 右ライトの比較値。
+ * @param ccr_l 左ライトの比較値。
+ * @return なし。
+ */
 static void set_pwm(uint16_t ccr_r, uint16_t ccr_l)
 {
     __HAL_TIM_SET_COMPARE(s_htim, TIM_CHANNEL_1, ccr_r);
     __HAL_TIM_SET_COMPARE(s_htim, TIM_CHANNEL_2, ccr_l);
 }
 
+/**
+ * @brief 左右の光量を保存し、PWMへ反映する。
+ * @param pct_r 右ライト光量[%]。
+ * @param pct_l 左ライト光量[%]。
+ * @return なし。
+ */
 static void apply_brightness(uint8_t pct_r, uint8_t pct_l)
 {
     s_brightness_r = pct_r;
@@ -56,15 +72,20 @@ static void apply_brightness(uint8_t pct_r, uint8_t pct_l)
     set_pwm(percent_to_ccr(pct_r), percent_to_ccr(pct_l));
 }
 
-/* 正弦波補間 (phase 0〜period → 輝度 0〜100) */
+/**
+ * @brief 正弦波近似表から呼吸点灯の光量を求める。
+ * @param phase 現在の周期内時刻。
+ * @param period 1周期の長さ。
+ * @return 0から100%の光量。
+ */
 static uint8_t breath_value(uint16_t phase, uint16_t period)
 {
-    /* phase を 0〜65535 に正規化 */
+    /* 周期内時刻を0から65535へ正規化する。 */
     uint32_t norm = (uint32_t)phase * 65536 / period;
     uint16_t idx;
     uint8_t  val;
 
-    /* 四半波展開 */
+    /* 1/4周期の表を折り返し、正弦波1周期へ展開する。 */
     if (norm < 16384) {
         idx = (uint16_t)(norm * 16 / 16384);
         val = s_sine_quarter[idx];
@@ -79,22 +100,20 @@ static uint8_t breath_value(uint16_t phase, uint16_t period)
         val = s_sine_quarter[idx];
     }
 
-    /* 0-255 → 0-100 */
+    /* テーブル値0から255を光量0から100%へ変換する。 */
     return (uint8_t)((uint16_t)val * 100 / 255);
 }
-
-/* ---------- 公開 API ---------- */
 
 void LED_Init(TIM_HandleTypeDef *htim)
 {
     s_htim = htim;
 
-    /* TIM2 を PWM 用に再設定 (CubeMX のデフォルトは Period=MAX) */
+    /* CubeMX初期値を1 kHz PWM用のPSCとARRへ上書きする。 */
     s_htim->Instance->PSC = LED_PWM_PSC;
     s_htim->Instance->ARR = LED_PWM_ARR;
-    s_htim->Instance->EGR = TIM_EGR_UG;   /* 強制更新で PSC/ARR を即反映 */
+    s_htim->Instance->EGR = TIM_EGR_UG;   /* 強制更新して設定を即時反映。 */
 
-    /* PWM 出力開始 (duty=0 で消灯状態) */
+    /* duty 0の消灯状態で左右PWMを開始する。 */
     HAL_TIM_PWM_Start(s_htim, TIM_CHANNEL_1);
     HAL_TIM_PWM_Start(s_htim, TIM_CHANNEL_2);
 
@@ -109,7 +128,7 @@ void LED_SetMode(LedMode_t mode)
 {
     if (mode > LM_BATTERY) return;
 
-    /* ブレーキ等の自動割込モードの場合、復帰先を保存 */
+    /* 一時的なブレーキ点灯では、終了後に戻すモードを保存する。 */
     if (mode == LM_BRAKE) {
         if (!s_override) {
             s_base_mode = s_mode;
@@ -126,7 +145,7 @@ void LED_SetMode(LedMode_t mode)
     s_breath_phase = 0;
     s_welcome_step = 0;
 
-    /* 即時反映が必要なモード */
+    /* 固定点灯モードはここで反映し、点滅系はLED_Updateで進める。 */
     switch (mode) {
         case LM_OFF:
             apply_brightness(0, 0);
@@ -140,11 +159,11 @@ void LED_SetMode(LedMode_t mode)
             break;
         case LM_AUTO:
         case LM_ADAPTIVE:
-            /* センサ/モーター連動は外部から LED_SetBrightness で更新 */
+            /* センサー連動値は外部からLED_SetBrightnessで更新する。 */
             apply_brightness(LED_LOW_PERCENT, LED_LOW_PERCENT);
             break;
         default:
-            /* 点滅系は LED_Update で処理 */
+            /* 点滅・アニメーション系はLED_Updateで処理する。 */
             break;
     }
 }
@@ -210,7 +229,7 @@ void LED_Update(void)
         }
 
         case LM_BREATH: {
-            /* 1ms 単位で phase を進める */
+            /* 現在時刻から呼吸点灯の周期内位置を求める。 */
             s_breath_phase = (uint16_t)(now % BREATH_PERIOD_MS);
             uint8_t pct = breath_value(s_breath_phase, BREATH_PERIOD_MS);
             apply_brightness(pct, pct);
@@ -219,13 +238,13 @@ void LED_Update(void)
 
         case LM_WELCOME: {
             if (s_welcome_done) {
-                /* ウェルカム完了後は OFF に遷移 */
+                /* ウェルカム完了後はOFFへ移行する。 */
                 LED_SetMode(LM_OFF);
                 break;
             }
             if (elapsed >= WELCOME_STEP_MS) {
                 s_last_tick = now;
-                /* 左右交互にフェードイン・フェードアウト */
+                /* 左右を交互に明るくする。 */
                 if (s_welcome_step < WELCOME_STEPS) {
                     uint8_t pct = (uint8_t)((uint16_t)(s_welcome_step + 1) * 100 / WELCOME_STEPS);
                     if (s_welcome_step & 1) {
@@ -235,7 +254,7 @@ void LED_Update(void)
                     }
                     s_welcome_step++;
                 } else {
-                    /* 最後に両方全灯→消灯 */
+                    /* 最後に左右を全点灯し、次回更新で消灯する。 */
                     apply_brightness(LED_HIGH_PERCENT, LED_HIGH_PERCENT);
                     s_welcome_done = 1;
                 }
@@ -244,7 +263,7 @@ void LED_Update(void)
         }
 
         case LM_BATTERY: {
-            /* バッテリー残量表示: 低速点滅で通知 (1Hz) */
+            /* バッテリー通知は30%光量で1 Hz点滅する。 */
             if (elapsed >= 500) {
                 s_blink_state ^= 1;
                 uint8_t pct = s_blink_state ? LED_LOW_PERCENT : 0;
