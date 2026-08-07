@@ -88,7 +88,7 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-  /* 診断: 全LEDを4Hz点滅 → HardFault発生を目視確認 */
+  /* HardFaultを目視できるよう、全デバッグLEDを点滅させる。 */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
@@ -240,7 +240,12 @@ void DMA1_Channel2_IRQHandler(void)
 void SPI1_IRQHandler(void)
 {
   /* USER CODE BEGIN SPI1_IRQn 0 */
-
+  /*
+   * HALの汎用処理ではなく専用ハンドラーを呼び、I2C処理中でも
+   * ESP32から届くSPI byteを取りこぼさないようにする。
+   */
+  SPI_Slave_IRQHandler();
+  return;
   /* USER CODE END SPI1_IRQn 0 */
   HAL_SPI_IRQHandler(&hspi1);
   /* USER CODE BEGIN SPI1_IRQn 1 */
@@ -263,13 +268,22 @@ void USART2_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+/**
+ * @brief SPI1のNSS立ち上がり用EXTI4割り込みをHALへ渡す。
+ * @return なし。
+ */
 void EXTI4_IRQHandler(void)
 {
-    /* 診断: LED1 を直接書込み → EXTI4 が発火したか確認 */
-    GPIOC->BSRR = GPIO_PIN_11;  /* PC11 = LED1 */
+    /* 割り込み確認用にLED1を点灯する。 */
+    GPIOC->BSRR = GPIO_PIN_11;
     HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_4);
 }
 
+/**
+ * @brief NSSのEXTI通知をSPI通信モジュールへ渡す。
+ * @param GPIO_Pin 割り込みが発生したGPIOピン。
+ * @return なし。
+ */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == GPIO_PIN_4) {

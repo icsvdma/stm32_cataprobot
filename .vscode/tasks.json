@@ -14,6 +14,87 @@
 				"$gcc"
 			],
 			"group": "build"
+		},
+		{
+			"label": "STM32 Build Debug",
+			"type": "shell",
+			"command": "${env:LOCALAPPDATA}\\stm32cube\\bundles\\cmake\\4.2.3+st.1\\bin\\cmake.exe",
+			"args": [
+				"--build",
+				"${workspaceFolder}\\cubeMX_stm32g473_test\\build\\Debug"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}",
+				"shell": {
+					"executable": "cmd.exe",
+					"args": [
+						"/c"
+					]
+				}
+			},
+			"group": "build",
+			"problemMatcher": [
+				"$gcc"
+			]
+		},
+		{
+			"label": "STM32 Flash via DFU",
+			"type": "shell",
+			"command": "${env:ProgramFiles}\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=USB1",
+				"-e",
+				"all",
+				"-w",
+				"${workspaceFolder}\\cubeMX_stm32g473_test\\build\\Debug\\cubeMX_stm32g473_test.elf",
+				"-v",
+				"-s",
+				"0x08000000"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}",
+				"shell": {
+					"executable": "cmd.exe",
+					"args": [
+						"/c"
+					]
+				}
+			},
+			"group": "build",
+			"problemMatcher": [],
+			"detail": "Mass-erase Flash, write and verify the Debug firmware through USB DFU, then start at 0x08000000."
+		},
+		{
+			"label": "STM32 Start Application via DFU",
+			"type": "shell",
+			"command": "${env:ProgramFiles}\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=USB1",
+				"-g",
+				"0x08000000"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}",
+				"shell": {
+					"executable": "cmd.exe",
+					"args": [
+						"/c"
+					]
+				}
+			},
+			"problemMatcher": [],
+			"detail": "Start the firmware already stored in Flash without rewriting it."
+		},
+		{
+			"label": "STM32 Build and Flash via DFU",
+			"dependsOrder": "sequence",
+			"dependsOn": [
+				"STM32 Build Debug",
+				"STM32 Flash via DFU"
+			],
+			"problemMatcher": []
 		}
 	]
 }

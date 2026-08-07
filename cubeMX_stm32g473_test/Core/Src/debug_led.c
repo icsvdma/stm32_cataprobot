@@ -1,6 +1,7 @@
 #include "debug_led.h"
 #include "config.h"
 
+/** @brief デバッグLED1個分のGPIO、動作モード、点滅状態。 */
 typedef struct {
     GPIO_TypeDef   *port;
     uint16_t        pin;
@@ -20,7 +21,7 @@ static DebugLedEntry_t s_leds[DBG_LED_COUNT] = {
 
 void DebugLed_Init(void)
 {
-    /* PC10-PC15 のクロックは CubeMX で有効化済みの前提 */
+    /* PC10からPC15のクロックはCubeMXで有効化済みとする。 */
     GPIO_InitTypeDef gpio = {0};
     gpio.Pin   = PIN_DBG_LED0 | PIN_DBG_LED1 | PIN_DBG_LED2
                | PIN_DBG_LED3 | PIN_DBG_LED4 | PIN_DBG_LED5;
@@ -38,6 +39,7 @@ void DebugLed_Init(void)
 
 void DebugLed_Set(uint8_t led_mask, DebugLedMode_t mode)
 {
+    /* マスクで選ばれたLEDだけ、モードと開始時刻を更新する。 */
     for (uint8_t i = 0; i < DBG_LED_COUNT; i++) {
         if (led_mask & (1U << i)) {
             s_leds[i].mode = mode;
@@ -61,10 +63,10 @@ void DebugLed_Update(void)
         uint32_t period_ms;
         switch (s_leds[i].mode) {
             case DBG_LED_BLINK_1HZ:
-                period_ms = 500;  /* 500ms ON / 500ms OFF = 1Hz */
+                period_ms = 500;  /* 500 msごとに反転すると1 Hz点滅。 */
                 break;
             case DBG_LED_BLINK_4HZ:
-                period_ms = 125;  /* 125ms ON / 125ms OFF = 4Hz */
+                period_ms = 125;  /* 125 msごとに反転すると4 Hz点滅。 */
                 break;
             default:
                 continue;

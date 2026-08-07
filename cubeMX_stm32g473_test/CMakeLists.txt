@@ -33,6 +33,9 @@ enable_language(C ASM)
 
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
+set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES
+    SUFFIX ".elf"
+)
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
@@ -48,6 +51,11 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/uart_comm.c
     Core/Src/spi_comm.c
     Core/Src/debug_led.c
+    Core/Src/led_control.c
+    Core/Src/motor_hbridge.c
+    Core/Src/icm20948.c
+    Core/Src/bmp280.c
+    Core/Src/external_sensors.c
 )
 
 # Add include paths
