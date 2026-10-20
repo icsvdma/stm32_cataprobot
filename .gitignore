@@ -7,3 +7,7 @@ esp32_firm/esp32_cataprobot/.vscode/.browse.c_cpp.db*
 esp32_firm/esp32_cataprobot/.vscode/c_cpp_properties.json
 esp32_firm/esp32_cataprobot/.vscode/launch.json
 esp32_firm/esp32_cataprobot/.vscode/ipch
+
+# Related ESP32 repository is an independent checkout.
+/esp32_firm/esp32_cataprobot/
+/tests/.build/

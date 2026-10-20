@@ -21,6 +21,12 @@
 | [ハードウェア仕様書](hardware_spec_template.md) | ピン、I2C、SPI、Hブリッジ配線を確認する | 回路・実装担当 |
 | [実装計画・実績](implementation_plan.md) | 実装済み項目と実機確認項目を確認する | 管理・試験担当 |
 
+## 合意済みの改善仕様
+
+- [現行仕様の調査と改善候補](spec_review_2026-10-20.md): コード根拠と設計判断の記録。
+- [安全制御の改善仕様](safety_improvement_spec.md): 合意済み要件、受入条件、実機走行前の確認事項。未実装・実機未検証。
+- [用語集](../GLOSSARY.md) / [通信断停止の設計判断](adr/0001-motor-command-expiry.md)
+
 ## 履歴資料
 
 - [SPI通信障害調査記録](history/SPI通信障害調査記録.md)
