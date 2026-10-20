@@ -53,6 +53,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/debug_led.c
     Core/Src/led_control.c
     Core/Src/motor_hbridge.c
+    Core/Src/motor_safety.c
+    Core/Src/motor_protocol.c
     Core/Src/icm20948.c
     Core/Src/bmp280.c
     Core/Src/external_sensors.c

@@ -128,9 +128,10 @@ int main(void)
 	 * 状態LED -> SPIスレーブ -> ヘッドライト -> Hブリッジ -> I2Cセンサー。
 	 */
 	DebugLed_Init();
-	SPI_Slave_Init(&hspi1);
 	LED_Init(&htim2);
 	HBridge_Init(&htim8);
+	HAL_NVIC_SetPriority(SysTick_IRQn, 0U, 0U);
+	SPI_Slave_Init(&hspi1);
 	ExternalSensors_Init(&hi2c1);
 	DebugLed_Set(0x01, DBG_LED_BLINK_4HZ);  /* LED0: メインループ動作中。 */
 	GPIOC->BSRR = PIN_DBG_LED1;             /* LED1: 全初期化完了。 */
@@ -147,7 +148,6 @@ int main(void)
 	SPI_Slave_Poll();
 	DebugLed_Update();
 	LED_Update();
-	HBridge_Update();
 	ExternalSensors_Poll(HAL_GetTick());
 	HAL_IWDG_Refresh(&hiwdg);
   }

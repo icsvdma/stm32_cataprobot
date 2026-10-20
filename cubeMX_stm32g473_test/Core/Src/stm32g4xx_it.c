@@ -23,6 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "spi_comm.h"
+#include "motor_hbridge.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -88,6 +89,7 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
+  HBridge_EmergencyStop();
   /* HardFaultを目視できるよう、全デバッグLEDを点滅させる。 */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   /* USER CODE END HardFault_IRQn 0 */
@@ -195,7 +197,7 @@ void SysTick_Handler(void)
   /* USER CODE END SysTick_IRQn 0 */
   HAL_IncTick();
   /* USER CODE BEGIN SysTick_IRQn 1 */
-
+  if ((HAL_GetTick() % 5U) == 0U) { HBridge_Update(); }
   /* USER CODE END SysTick_IRQn 1 */
 }
 

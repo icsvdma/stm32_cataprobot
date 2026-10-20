@@ -87,13 +87,6 @@ static void prepare_nack(uint8_t original_cmd, uint8_t error_code)
     prepare_response(&nack);
 }
 
-/** @brief シャットダウン完了応答を準備する。@return なし。 */
-static void prepare_shutdown_ack(void)
-{
-    Packet_t ack;
-    Packet_Build(&ack, CMD_SHUTDOWN_ACK, NULL, 0U);
-    prepare_response(&ack);
-}
 
 /** @brief 最新センサー値をVersion 2の32 byte応答へ変換する。@return なし。 */
 static void prepare_sensor_response(void)
@@ -200,73 +193,6 @@ static CmdHandlerResult_t handle_led_brightness(const Packet_t *pkt)
     return CMD_HANDLER_OK;
 }
 
-/**
- * @brief モーター方向・速度コマンドをHブリッジ制御へ渡す。
- * @param pkt 受信パケット。
- * @return 正常またはパラメーターエラー。
- */
-static CmdHandlerResult_t handle_motor_speed(const Packet_t *pkt)
-{
-    if (pkt == NULL || pkt->length != 4U) {
-        return CMD_HANDLER_INVALID_PARAMETER;
-    }
-
-    uint8_t ch_id = pkt->payload[0];
-    uint8_t dir_id = pkt->payload[1];
-    uint16_t speed = ((uint16_t)pkt->payload[2] << 8) | pkt->payload[3];
-    if (dir_id > HBRIDGE_DIR_BRAKE || speed > 1000U) {
-        return CMD_HANDLER_INVALID_PARAMETER;
-    }
-
-    HBridge_Direction_t dir = (HBridge_Direction_t)dir_id;
-    if (ch_id == 0xFFU) {
-        HBridge_SetMotor(HBRIDGE_CH_A, dir, speed);
-        HBridge_SetMotor(HBRIDGE_CH_B, dir, speed);
-    } else if (ch_id <= HBRIDGE_CH_B) {
-        HBridge_SetMotor((HBridge_Channel_t)ch_id, dir, speed);
-    } else {
-        return CMD_HANDLER_INVALID_PARAMETER;
-    }
-    return CMD_HANDLER_OK;
-}
-
-/**
- * @brief 指定モーターの通常停止コマンドを処理する。
- * @param pkt 受信パケット。
- * @return 正常またはパラメーターエラー。
- */
-static CmdHandlerResult_t handle_motor_stop(const Packet_t *pkt)
-{
-    if (pkt == NULL || pkt->length != 1U) {
-        return CMD_HANDLER_INVALID_PARAMETER;
-    }
-
-    uint8_t ch_id = pkt->payload[0];
-    if (ch_id == 0xFFU) {
-        HBridge_Stop(HBRIDGE_CH_A);
-        HBridge_Stop(HBRIDGE_CH_B);
-    } else if (ch_id <= HBRIDGE_CH_B) {
-        HBridge_Stop((HBridge_Channel_t)ch_id);
-    } else {
-        return CMD_HANDLER_INVALID_PARAMETER;
-    }
-    return CMD_HANDLER_OK;
-}
-
-/**
- * @brief 左右モーターの緊急停止コマンドを処理する。
- * @param pkt 受信パケット。
- * @return 正常またはパラメーターエラー。
- */
-static CmdHandlerResult_t handle_emergency_stop(const Packet_t *pkt)
-{
-    if (pkt == NULL || pkt->length != 0U) {
-        return CMD_HANDLER_INVALID_PARAMETER;
-    }
-    HBridge_EmergencyStop();
-    return CMD_HANDLER_OK;
-}
-
 void SPI_Slave_Init(SPI_HandleTypeDef *hspi)
 {
     s_hspi = hspi;
@@ -300,9 +226,6 @@ static const struct {
     uint8_t cmd;
     CmdHandler_t handler;
 } spi_cmd_table[] = {
-    {CMD_MOTOR_SPEED, handle_motor_speed},
-    {CMD_MOTOR_STOP, handle_motor_stop},
-    {CMD_EMERGENCY_STOP, handle_emergency_stop},
     {CMD_LED_MODE, handle_led_mode},
     {CMD_LED_BRIGHTNESS, handle_led_brightness},
     {CMD_DEBUG_LED, process_debug_led},
@@ -319,25 +242,23 @@ void SPI_Slave_Dispatch(const uint8_t *buf, uint8_t len)
         return;
     }
 
-    /* センサー要求とシャットダウンは専用応答があるため個別処理する。 */
+    Packet_t motor_response;
+    if (HBridge_Process(&pkt, &motor_response)) {
+        if (motor_response.cmd == CMD_SHUTDOWN_ACK) {
+            LED_AllOff();
+            DebugLed_AllOff();
+        }
+        prepare_response(&motor_response);
+        return;
+    }
+
+    /* センサー要求は専用応答を返す。 */
     if (pkt.cmd == CMD_SENSOR_REQ) {
         if (pkt.length != 1U || pkt.payload[0] != 0xFFU) {
             prepare_nack(pkt.cmd, SPI_ERROR_INVALID_PARAMETER);
             return;
         }
         prepare_sensor_response();
-        return;
-    }
-
-    if (pkt.cmd == CMD_SHUTDOWN) {
-        if (pkt.length != 0U) {
-            prepare_nack(pkt.cmd, SPI_ERROR_INVALID_PARAMETER);
-            return;
-        }
-        HBridge_EmergencyStop();
-        LED_AllOff();
-        DebugLed_AllOff();
-        prepare_shutdown_ack();
         return;
     }
 
