@@ -49,7 +49,7 @@ uint8_t ExternalSensors_Init(I2C_HandleTypeDef *hi2c);
 uint8_t ExternalSensors_Poll(uint32_t now_ms);
 
 /**
- * @brief 最後に取得できた値と状態をコピーする。
+ * @brief 完成した値と状態をコピーし、群別の有効期限を現在時刻で検証する。
  * @param snapshot コピー先。`NULL`の場合は何もしない。
  * @return なし。
  */

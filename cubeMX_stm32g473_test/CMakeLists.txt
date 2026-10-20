@@ -50,6 +50,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/packet.c
     Core/Src/uart_comm.c
     Core/Src/spi_comm.c
+    Core/Src/spi_frame.c
     Core/Src/debug_led.c
     Core/Src/led_control.c
     Core/Src/motor_hbridge.c

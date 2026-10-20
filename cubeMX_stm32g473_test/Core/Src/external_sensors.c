@@ -31,6 +31,27 @@ static uint8_t s_motion_failures;
 static uint8_t s_magnetic_failures;
 static uint8_t s_env_failures;
 
+/* mainの作業値と、割り込みへ公開する完成済み値を分ける。 */
+typedef struct {
+    ExternalSensorSnapshot_t snapshot;
+    uint32_t motion_time;
+    uint32_t magnetic_time;
+    uint32_t environment_time;
+} PublishedSnapshot;
+static PublishedSnapshot s_published;
+
+/** 完成した値と取得時刻を短い排他区間で公開する。戻り値なし。 */
+static void publish_snapshot(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    s_published.snapshot = s_snapshot;
+    s_published.motion_time = s_last_motion_success;
+    s_published.magnetic_time = s_last_magnetic_success;
+    s_published.environment_time = s_last_env_success;
+    __set_PRIMASK(primask);
+}
+
 /**
  * @brief 加速度・ジャイロを初期化し、同時に地磁気も初期化する。
  * @param now_ms 再試行時刻として記録する現在時刻[ms]。
@@ -116,6 +137,7 @@ uint8_t ExternalSensors_Init(I2C_HandleTypeDef *hi2c)
     s_motion_failures = 0U;
     s_magnetic_failures = 0U;
     s_env_failures = 0U;
+    publish_snapshot();
 
     if (s_hi2c == NULL) {
         s_snapshot.status =
@@ -123,11 +145,13 @@ uint8_t ExternalSensors_Init(I2C_HandleTypeDef *hi2c)
             SENSOR_STATUS_GYRO_ERROR |
             SENSOR_STATUS_MAG_ERROR |
             SENSOR_STATUS_ENV_ERROR;
+        publish_snapshot();
         return s_snapshot.status;
     }
 
     initialize_motion(HAL_GetTick());
     initialize_environment(HAL_GetTick());
+    publish_snapshot();
     return s_snapshot.status;
 }
 
@@ -153,6 +177,7 @@ uint8_t ExternalSensors_Poll(uint32_t now_ms)
         initialize_environment(now_ms);
     }
 
+    now_ms = HAL_GetTick();
     /* 加速度とジャイロは同じ連続レジスターから100 Hzで取得する。 */
     if (s_motion.initialized &&
         (now_ms - s_last_motion_poll) >= MOTION_PERIOD_MS) {
@@ -168,7 +193,8 @@ uint8_t ExternalSensors_Poll(uint32_t now_ms)
             s_snapshot.gyroscope_y_deci_dps = gyroscope[1];
             s_snapshot.gyroscope_z_deci_dps = gyroscope[2];
             s_motion_failures = 0U;
-            s_last_motion_success = now_ms;
+            s_last_motion_success = HAL_GetTick();
+            s_snapshot.sample_time_ms = s_last_motion_success;
             s_snapshot.status |=
                 SENSOR_STATUS_ACCEL_VALID | SENSOR_STATUS_GYRO_VALID;
             s_snapshot.status &=
@@ -201,7 +227,8 @@ uint8_t ExternalSensors_Poll(uint32_t now_ms)
             s_snapshot.magnetic_y_deci_ut = magnetic[1];
             s_snapshot.magnetic_z_deci_ut = magnetic[2];
             s_magnetic_failures = 0U;
-            s_last_magnetic_success = now_ms;
+            s_last_magnetic_success = HAL_GetTick();
+            s_snapshot.sample_time_ms = s_last_magnetic_success;
             s_snapshot.status |= SENSOR_STATUS_MAG_VALID;
             s_snapshot.status &= (uint8_t)~SENSOR_STATUS_MAG_ERROR;
             updated = 1U;
@@ -222,7 +249,8 @@ uint8_t ExternalSensors_Poll(uint32_t now_ms)
                 &s_snapshot.temperature_centi_c,
                 &s_snapshot.pressure_pa) == BMP280_OK) {
             s_env_failures = 0U;
-            s_last_env_success = now_ms;
+            s_last_env_success = HAL_GetTick();
+            s_snapshot.sample_time_ms = s_last_env_success;
             s_snapshot.status |= SENSOR_STATUS_ENV_VALID;
             s_snapshot.status &= (uint8_t)~SENSOR_STATUS_ENV_ERROR;
             updated = 1U;
@@ -233,6 +261,7 @@ uint8_t ExternalSensors_Poll(uint32_t now_ms)
         }
     }
 
+    now_ms = HAL_GetTick();
     /* 一度成功していても、期限内に更新されなければ有効状態を取り消す。 */
     if ((s_snapshot.status & SENSOR_STATUS_ACCEL_VALID) != 0U &&
         (now_ms - s_last_motion_success) > MOTION_STALE_TIMEOUT_MS) {
@@ -255,14 +284,35 @@ uint8_t ExternalSensors_Poll(uint32_t now_ms)
     /* どれか1種類でも更新したときだけ通し番号と取得時刻を進める。 */
     if (updated) {
         s_snapshot.sequence++;
-        s_snapshot.sample_time_ms = now_ms;
     }
+    publish_snapshot();
     return s_snapshot.status;
 }
 
 void ExternalSensors_GetSnapshot(ExternalSensorSnapshot_t *snapshot)
 {
     if (snapshot != NULL) {
-        *snapshot = s_snapshot;
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        PublishedSnapshot published = s_published;
+        __set_PRIMASK(primask);
+        *snapshot = published.snapshot;
+        uint32_t now = HAL_GetTick();
+        if (now - published.motion_time >= MOTION_STALE_TIMEOUT_MS) {
+            if ((snapshot->status & (SENSOR_STATUS_ACCEL_VALID | SENSOR_STATUS_GYRO_VALID)) != 0U) {
+                snapshot->status &= (uint8_t)~(SENSOR_STATUS_ACCEL_VALID | SENSOR_STATUS_GYRO_VALID);
+                snapshot->status |= SENSOR_STATUS_ACCEL_ERROR | SENSOR_STATUS_GYRO_ERROR;
+            }
+        }
+        if (now - published.magnetic_time >= MAGNETIC_STALE_TIMEOUT_MS &&
+            (snapshot->status & SENSOR_STATUS_MAG_VALID) != 0U) {
+            snapshot->status &= (uint8_t)~SENSOR_STATUS_MAG_VALID;
+            snapshot->status |= SENSOR_STATUS_MAG_ERROR;
+        }
+        if (now - published.environment_time >= ENV_STALE_TIMEOUT_MS &&
+            (snapshot->status & SENSOR_STATUS_ENV_VALID) != 0U) {
+            snapshot->status &= (uint8_t)~SENSOR_STATUS_ENV_VALID;
+            snapshot->status |= SENSOR_STATUS_ENV_ERROR;
+        }
     }
 }

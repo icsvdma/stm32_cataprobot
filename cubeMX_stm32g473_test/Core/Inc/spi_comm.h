@@ -44,7 +44,7 @@ void                SPI_Slave_NssRisingCallback(void);
  */
 void                SPI_Slave_IRQHandler(void);
 
-/** @brief CS解除後に通信状態を次のフレーム用へ戻す。@return なし。 */
+/** @brief 互換用。NSS割り込みがフレームを処理するため何もしない。@return なし。 */
 void                SPI_Slave_Poll(void);
 
 #endif /* SPI_COMM_H */

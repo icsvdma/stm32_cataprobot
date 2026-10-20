@@ -4,8 +4,8 @@
 
 | Issue | 成果 | 状態 |
 |---|---|---|
-| [#3](https://github.com/icsvdma/stm32_cataprobot/issues/3) | STM32の走行許可・停止保持・時間制御・SPIプロトコル | 作業中 |
-| [#4](https://github.com/icsvdma/stm32_cataprobot/issues/4) | センサー復旧中の制御とSPI、整合したスナップショット | #3に依存 |
+| [#3](https://github.com/icsvdma/stm32_cataprobot/issues/3) | STM32の走行許可・停止保持・時間制御・SPIプロトコル | 実装・ホスト試験・Debugビルド済み |
+| [#4](https://github.com/icsvdma/stm32_cataprobot/issues/4) | センサー復旧中の制御とSPI、整合したスナップショット | 実装・ホスト試験・Debugビルド済み |
 | [#5](https://github.com/icsvdma/stm32_cataprobot/issues/5) | ESP32操作・異常停止・Web表示 | #3に依存 |
 
 ESP32は `esp32_firm/esp32_cataprobot/` の独立チェックアウトで編集する。元のユーザーフォルダーは変更しない。
@@ -24,6 +24,10 @@ ESP32は `esp32_firm/esp32_cataprobot/` の独立チェックアウトで編集�
 
 ## 検証
 
-実装後にホスト試験、STM32 Debug/Releaseビルド、ESP32ビルド、Web表示確認を記録する。
+ホスト試験4件（モーター安全状態、SPIモーターコマンド、センサースナップショット、SPIフレーム）が成功。STM32 Debugビルドが成功。
+
+センサーの低レベル初期化待ちはメインループに残し、制御更新とNSS境界処理を独立した割り込みへ移した。完成済みスナップショットの公開と、読出し時の群別期限判定により、待ち中も未完成値や古い有効値を返さない。
+
+STM32 Releaseビルド、ESP32ビルド、Web表示確認は後続で実施する。
 
 実機の制動特性、停止距離、更新間隔の実測は未実施。実機への書込みと走行試験は今回の対象外。

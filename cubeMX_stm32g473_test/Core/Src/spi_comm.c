@@ -4,6 +4,7 @@
 #include "led_control.h"
 #include "motor_hbridge.h"
 #include "external_sensors.h"
+#include "spi_frame.h"
 #include <string.h>
 
 /* NACKでESP32へ通知するエラー理由。 */
@@ -12,14 +13,12 @@
 
 /* 割り込みとメインループで共有するSPI受信・応答状態。 */
 static SPI_HandleTypeDef *s_hspi;
-static uint8_t s_rx_buf[SPI_RX_BUF_SIZE];
-static volatile uint8_t s_rx_idx = 0U;
+static SpiFrame s_frame;
 
 static uint8_t s_tx_buf[PACKET_MAX_SIZE + 1U];
 static volatile uint8_t s_tx_len = 0U;
 static volatile uint8_t s_tx_idx = 0U;
-static volatile uint32_t s_last_rx_tick = 0U;
-static volatile uint8_t s_frame_parsed = 0U;
+static void dispatch_packet(const Packet_t *packet);
 
 /* 各コマンドハンドラーの内部処理結果。 */
 typedef enum {
@@ -196,8 +195,7 @@ static CmdHandlerResult_t handle_led_brightness(const Packet_t *pkt)
 void SPI_Slave_Init(SPI_HandleTypeDef *hspi)
 {
     s_hspi = hspi;
-    s_rx_idx = 0U;
-    memset(s_rx_buf, 0, sizeof(s_rx_buf));
+    SpiFrame_Reset(&s_frame);
     s_tx_len = 0U;
     s_tx_idx = 0U;
 
@@ -208,7 +206,16 @@ void SPI_Slave_Init(SPI_HandleTypeDef *hspi)
     s_hspi->Instance->CR2 &= ~SPI_CR2_TXEIE;
     s_hspi->Instance->CR2 |= SPI_CR2_RXNEIE | SPI_CR2_ERRIE;
     HAL_NVIC_DisableIRQ(DMA1_Channel2_IRQn);
-    HAL_NVIC_DisableIRQ(EXTI4_IRQn);
+    /* NSSをAF5のままEXTIへ接続する。GPIOモードを入力へ変更しない。 */
+    SYSCFG->EXTICR[1] &= ~SYSCFG_EXTICR2_EXTI4;
+    EXTI->RTSR1 |= GPIO_PIN_4;
+    EXTI->FTSR1 &= ~GPIO_PIN_4;
+    EXTI->PR1 = GPIO_PIN_4;
+    EXTI->IMR1 |= GPIO_PIN_4;
+    HAL_NVIC_SetPriority(SPI1_IRQn, 1U, 0U);
+    HAL_NVIC_SetPriority(EXTI4_IRQn, 1U, 0U);
+    HAL_NVIC_ClearPendingIRQ(EXTI4_IRQn);
+    HAL_NVIC_EnableIRQ(EXTI4_IRQn);
 
     __HAL_SPI_ENABLE(s_hspi);
     HAL_NVIC_ClearPendingIRQ(SPI1_IRQn);
@@ -242,6 +249,13 @@ void SPI_Slave_Dispatch(const uint8_t *buf, uint8_t len)
         return;
     }
 
+    dispatch_packet(&pkt);
+}
+
+/** 検証済みpacketを実行し、SPI応答を準備する。戻り値なし。 */
+static void dispatch_packet(const Packet_t *packet)
+{
+    Packet_t pkt = *packet;
     Packet_t motor_response;
     if (HBridge_Process(&pkt, &motor_response)) {
         if (motor_response.cmd == CMD_SHUTDOWN_ACK) {
@@ -292,94 +306,43 @@ void SPI_Slave_RxCompleteCallback(void)
 
 void SPI_Slave_NssRisingCallback(void)
 {
-    /* CS解除はSPI_Slave_PollがGPIOと経過時間から判定する。 */
+    if (s_hspi == NULL || (GPIOA->IDR & GPIO_PIN_4) == 0U) { return; }
+    SPI_TypeDef *spi = s_hspi->Instance;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    spi->CR1 &= ~SPI_CR1_SPE;
+    /* NSS Highなので新しい受信はない。残ったFIFOだけを読み捨てる。 */
+    for (unsigned i = 0U; i < 4U && (spi->SR & SPI_SR_RXNE); ++i) { (void)spi->DR; }
+    (void)spi->SR;
+    s_tx_len = s_tx_idx = 0U;
+    SpiFrame_Reset(&s_frame);
+    spi->CR1 |= SPI_CR1_SPE;
+    __set_PRIMASK(primask);
 }
 
 void SPI_Slave_IRQHandler(void)
 {
-    if (s_hspi == NULL) {
-        return;
-    }
-
+    if (s_hspi == NULL) { return; }
     SPI_TypeDef *spi = s_hspi->Instance;
-
-    /* RXNEが立っている間、送信を補充しながら受信byteを保存する。 */
     while (spi->SR & SPI_SR_RXNE) {
         if (s_tx_idx < s_tx_len && (spi->SR & SPI_SR_TXE)) {
             *(volatile uint8_t *)&spi->DR = s_tx_buf[s_tx_idx++];
         }
-
         uint8_t byte = *(volatile uint8_t *)&spi->DR;
-        if (s_rx_idx < SPI_RX_BUF_SIZE) {
-            s_rx_buf[s_rx_idx++] = byte;
-        }
-        s_last_rx_tick = HAL_GetTick();
-
-        /* 最小4 byteが届いたら0xAAを探し、完全なパケットを早期解析する。 */
-        if (!s_frame_parsed && s_rx_idx >= 4U) {
-            for (uint8_t i = 0U; i < s_rx_idx; i++) {
-                if (s_rx_buf[i] != PACKET_HEADER) {
-                    continue;
-                }
-
-                uint8_t remaining = s_rx_idx - i;
-                if (remaining < 4U) {
-                    break;
-                }
-
-                uint8_t payload_len = s_rx_buf[i + 2U];
-                if (payload_len > PACKET_MAX_PAYLOAD) {
-                    break;
-                }
-
-                uint8_t packet_len = 3U + payload_len + 1U;
-                if (remaining < packet_len) {
-                    break;
-                }
-
-                SPI_Slave_Dispatch(&s_rx_buf[i], packet_len);
-                s_frame_parsed = 1U;
-                while (s_tx_idx < s_tx_len && (spi->SR & SPI_SR_TXE)) {
-                    *(volatile uint8_t *)&spi->DR = s_tx_buf[s_tx_idx++];
-                }
-                break;
-            }
-        }
+        Packet_t packet;
+        SpiFrameResult result = SpiFrame_Push(&s_frame, byte, &packet);
+        if (result == SPI_FRAME_READY) { dispatch_packet(&packet); }
+        if (result == SPI_FRAME_INVALID) { prepare_nack(packet.cmd, SPI_ERROR_INVALID_PARAMETER); }
+        preload_tx();
     }
-
-    /* オーバーランはDR、SRの順に読み、フラグを解除する。 */
     if (spi->SR & SPI_SR_OVR) {
         (void)spi->DR;
         (void)spi->SR;
+        s_frame.done = true;
     }
 }
 
 void SPI_Slave_Poll(void)
 {
-    if (s_hspi == NULL) {
-        return;
-    }
-
-    SPI_TypeDef *spi = s_hspi->Instance;
-    if (s_rx_idx > 0U) {
-        uint8_t cs_high = (GPIOA->IDR & GPIO_PIN_4) ? 1U : 0U;
-        uint32_t elapsed = HAL_GetTick() - s_last_rx_tick;
-        /*
-         * CSがHigh、または最後の受信から10 ms経過したら
-         * 割り込みを一時停止し、次のフレーム用に状態を戻す。
-         */
-        if (!(spi->SR & SPI_SR_BSY) && (cs_high || elapsed >= 10U)) {
-            HAL_NVIC_DisableIRQ(SPI1_IRQn);
-            s_rx_idx = 0U;
-            s_tx_len = 0U;
-            s_tx_idx = 0U;
-            s_frame_parsed = 0U;
-            s_last_rx_tick = 0U;
-
-            spi->CR1 &= ~SPI_CR1_SPE;
-            spi->CR1 |= SPI_CR1_SPE;
-            HAL_NVIC_ClearPendingIRQ(SPI1_IRQn);
-            HAL_NVIC_EnableIRQ(SPI1_IRQn);
-        }
-    }
+    /* フレーム境界はEXTI4で処理する。メインループの遅延に依存しない。 */
 }
